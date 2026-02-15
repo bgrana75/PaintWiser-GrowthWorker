@@ -24,6 +24,7 @@ import { MarketAnalysisService } from './services/market-analysis.js';
 import { PlanGenerationService } from './services/plan-generation.js';
 import { createAnalysisRouter } from './routes/analysis.js';
 import { createPlanRouter } from './routes/plan.js';
+import { createOAuthRouter } from './routes/oauth.js';
 
 async function main() {
   // Load config
@@ -86,6 +87,9 @@ async function main() {
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', service: 'growth-worker', timestamp: new Date().toISOString() });
   });
+
+  // OAuth routes (no auth — user authenticates via Google directly)
+  app.use('/oauth/google-ads', createOAuthRouter(config));
 
   // All API routes require auth
   app.use('/api', authMiddleware);
