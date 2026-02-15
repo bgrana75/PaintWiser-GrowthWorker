@@ -19,7 +19,8 @@ import { loadConfig } from './config.js';
 import { initDb, getUsageQuota } from './db.js';
 import { createAuthMiddleware } from './middleware/auth.js';
 import { createUsageMiddleware } from './middleware/usage.js';
-import { GooglePlacesCompetitorProvider, SerperCompetitorProvider, EstimateMarketDataProvider, OpenAiLlmProvider } from './providers/index.js';
+import { GooglePlacesCompetitorProvider, SerperCompetitorProvider, EstimateMarketDataProvider, GoogleAdsKeywordPlannerProvider, OpenAiLlmProvider } from './providers/index.js';
+import type { MarketDataProvider } from './providers/interfaces.js';
 import { MarketAnalysisService } from './services/market-analysis.js';
 import { PlanGenerationService } from './services/plan-generation.js';
 import { createAnalysisRouter } from './routes/analysis.js';
@@ -35,8 +36,35 @@ async function main() {
   // Initialize DB
   initDb(config);
 
-  // Initialize providers
-  const marketDataProvider = new EstimateMarketDataProvider();
+  // Initialize providers — use real Keyword Planner if configured, with estimate fallback
+  const useRealKeywordData = GoogleAdsKeywordPlannerProvider.isConfigured(config);
+  const estimateProvider = new EstimateMarketDataProvider();
+  let marketDataProvider: MarketDataProvider;
+  if (useRealKeywordData) {
+    const realProvider = new GoogleAdsKeywordPlannerProvider(config);
+    // Wrap with fallback: try real, resort to estimates if empty/error
+    marketDataProvider = {
+      async getKeywordData(services, cities, state) {
+        try {
+          const realData = await realProvider.getKeywordData(services, cities, state);
+          if (realData.length > 0) {
+            console.log(`[Fallback] Using real Keyword Planner data (${realData.length} keywords)`);
+            return realData;
+          }
+        } catch (err) {
+          console.warn('[Fallback] Keyword Planner failed, using estimates:', err);
+        }
+        console.log('[Fallback] No real data — using template estimates');
+        return estimateProvider.getKeywordData(services, cities, state);
+      },
+      setMarketFactor(f: number) {
+        estimateProvider.setMarketFactor(f);
+      },
+    } as MarketDataProvider;
+  } else {
+    marketDataProvider = estimateProvider;
+  }
+  console.log(`[Growth Worker] Keyword data source: ${useRealKeywordData ? 'Google Ads Keyword Planner (REAL) with estimate fallback' : 'Template estimates (FALLBACK)'}`);
   const competitorProvider = new GooglePlacesCompetitorProvider(config);
   const serpProvider = config.serpEnabled ? new SerperCompetitorProvider(config) : null;
   const llmProvider = new OpenAiLlmProvider(config);

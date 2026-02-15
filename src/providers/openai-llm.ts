@@ -107,12 +107,15 @@ ${input.websiteContent ? `  "websiteAnalysis": "2-4 sentence analysis based on t
     // Think about where homeowners with painting budgets live — affluent suburbs, established neighborhoods, etc.
     // Order by estimated opportunity (most valuable markets first).
     // Mark the top 8-10 as "recommended: true" and the rest as "recommended: false".
+    // VARY the avgCpc and estimatedSearches per city — affluent suburbs and high-demand areas should have higher CPC
+    // and more searches, while smaller/less competitive neighborhoods should have lower CPC. Use the keyword data
+    // CPC as a baseline and adjust ±10-30% depending on the city's affluence and competition.
     {
       "city": "city or neighborhood name",
       "state": "state code (derived from the zip code)",
-      "estimatedSearches": number or null,
-      "avgCpc": number or null (from keyword data, NOT invented),
-      "competition": "low" | "medium" | "high" or null,
+      "estimatedSearches": number or null (vary by city size and demand — larger cities get more, smaller suburbs less),
+      "avgCpc": number or null (vary by city — use keyword CPC as baseline, adjust ±10-30% based on city affluence/competition),
+      "competition": "low" | "medium" | "high" or null (should vary by city — some areas are more saturated than others),
       "distanceMiles": number or null,
       "reason": "why this city is recommended — mention demographics, home values, or demand",
       "recommended": true/false

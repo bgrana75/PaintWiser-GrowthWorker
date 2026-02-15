@@ -2,4 +2,5 @@ export { type MarketDataProvider, type CompetitorProvider, type LlmProvider } fr
 export { GooglePlacesCompetitorProvider } from './google-places.js';
 export { SerperCompetitorProvider } from './serper.js';
 export { EstimateMarketDataProvider, calculateMarketFactor } from './keyword-estimates.js';
+export { GoogleAdsKeywordPlannerProvider } from './google-ads-keyword-planner.js';
 export { OpenAiLlmProvider } from './openai-llm.js';

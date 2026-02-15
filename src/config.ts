@@ -21,6 +21,7 @@ export interface Config {
   googleAdsClientId: string;
   googleAdsClientSecret: string;
   googleAdsRefreshToken: string;
+  googleAdsMccCustomerId: string;
 
   // Serper (Phase 2)
   serperApiKey: string;
@@ -44,6 +45,7 @@ export function loadConfig(): Config {
     googleAdsClientId: process.env.GOOGLE_ADS_CLIENT_ID || '',
     googleAdsClientSecret: process.env.GOOGLE_ADS_CLIENT_SECRET || '',
     googleAdsRefreshToken: process.env.GOOGLE_ADS_REFRESH_TOKEN || '',
+    googleAdsMccCustomerId: (process.env.GOOGLE_ADS_MCC_CUSTOMER_ID || '').replace(/-/g, ''),
 
     serperApiKey: process.env.SERPER_API_KEY || '',
     serpEnabled: process.env.GROWTH_SERP_ENABLED === 'true',

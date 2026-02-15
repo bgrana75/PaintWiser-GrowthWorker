@@ -15,7 +15,7 @@
 
 import type { MarketAnalysisRequest, MarketAnalysis, MarketOverview, SerpResult } from '../types.js';
 import type { MarketDataProvider, CompetitorProvider, LlmProvider, LlmMarketAnalysisInput } from '../providers/interfaces.js';
-import { calculateMarketFactor, type EstimateMarketDataProvider } from '../providers/keyword-estimates.js';
+import { calculateMarketFactor, EstimateMarketDataProvider } from '../providers/keyword-estimates.js';
 import { getCrmSnapshot, logUsageEvent, saveMarketAnalysis } from '../db.js';
 import { analyzeWebsite, formatWebsiteForPrompt } from './website-analyzer.js';
 
