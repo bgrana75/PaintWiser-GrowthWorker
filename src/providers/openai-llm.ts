@@ -30,21 +30,26 @@ export class OpenAiLlmProvider implements LlmProvider {
   async synthesizeMarketAnalysis(input: LlmMarketAnalysisInput): Promise<LlmMarketAnalysisOutput> {
     // Compute data-driven budget guidance from actual keyword CPC data
     const cpcValues = input.keywords.map(k => k.avgCpc).filter(c => c > 0);
-    const avgCpc = cpcValues.length > 0
+    const hasKeywordData = cpcValues.length > 0;
+    const avgCpc = hasKeywordData
       ? Math.round(cpcValues.reduce((a, b) => a + b, 0) / cpcValues.length * 100) / 100
-      : 15;
-    const minCpc = cpcValues.length > 0 ? Math.min(...cpcValues) : 8;
-    const maxCpc = cpcValues.length > 0 ? Math.max(...cpcValues) : 25;
+      : null;
+    const minCpc = hasKeywordData ? Math.min(...cpcValues) : null;
+    const maxCpc = hasKeywordData ? Math.max(...cpcValues) : null;
     // Daily budget should afford at least 3-8 clicks/day
-    const suggestedDailyLow = Math.round(avgCpc * 3);
-    const suggestedDailyHigh = Math.round(avgCpc * 8);
+    const suggestedDailyLow = avgCpc ? Math.round(avgCpc * 3) : null;
+    const suggestedDailyHigh = avgCpc ? Math.round(avgCpc * 8) : null;
 
     const systemPrompt = `You are an expert Google Ads marketing strategist specializing in the painting contractor industry. You analyze market data and produce actionable recommendations.
 
 CRITICAL RULES:
-- You MUST use the avgCpc values from the keyword data provided below. Do NOT invent or estimate your own CPC values.
+${hasKeywordData ? `- You MUST use the avgCpc values from the keyword data provided below. Do NOT invent or estimate your own CPC values.
 - The serviceOpportunities avgCpc MUST match the weighted average CPC from the keyword data for that service.
-- Budget recommendations MUST be derived from the actual CPC data, not from generic assumptions.
+- Budget recommendations MUST be derived from the actual CPC data, not from generic assumptions.` : `- NO KEYWORD DATA IS AVAILABLE. The Google Ads Keyword Planner API did not return data (likely pending API access approval).
+- Set all CPC, monthlySearches, estimatedSearches, and budget values to 0 or null.
+- Do NOT invent, estimate, or hallucinate any CPC or search volume numbers.
+- Focus your analysis on competitor data and CRM data only.
+- In your summary, explicitly note that keyword/CPC data is unavailable and the analysis is limited.`}
 - You MUST respond with valid JSON matching the exact schema provided. No markdown, no explanation outside the JSON.`;
 
     const userPrompt = `Analyze this market data for a painting contractor and produce a strategic recommendation.
@@ -55,9 +60,12 @@ CRITICAL RULES:
 ${input.websiteContent ? `- Business website: ${input.websiteUrl}\n\n## Website Content (ACTUALLY FETCHED — base your analysis on this real data)\n${input.websiteContent}` : input.websiteUrl ? `- Business website: ${input.websiteUrl} (could not fetch — provide general recommendations)` : '- Business website: Not provided'}
 
 ## Keyword Data (search volumes & CPC estimates)
-IMPORTANT: These CPC values are market-specific estimates. Use them directly — do NOT substitute your own CPC numbers.
+${hasKeywordData ? `IMPORTANT: These CPC values are real data from Google Ads Keyword Planner. Use them directly — do NOT substitute your own CPC numbers.
 Average CPC across all keywords: $${avgCpc} (range: $${minCpc} - $${maxCpc})
-${JSON.stringify(input.keywords.slice(0, 50), null, 2)}
+${JSON.stringify(input.keywords.slice(0, 50), null, 2)}` : `⚠️ NO KEYWORD DATA AVAILABLE — Google Ads Keyword Planner did not return results.
+This likely means the developer token is still in test mode (Basic Access pending approval).
+You MUST set all avgCpc to 0, all monthlySearches to 0, and all estimatedSearches to 0 or null.
+Do NOT invent or guess any CPC or search volume numbers. Explicitly note this limitation in your summary.`}
 
 ## Competitors Found (${input.competitors.length} total)
 ${JSON.stringify(input.competitors.slice(0, 15), null, 2)}
@@ -66,10 +74,15 @@ ${input.serpResults.length > 0 ? `## SERP Analysis (competitor ads)\n${JSON.stri
 
 ${input.crmData ? `## CRM Data (business performance)\n${JSON.stringify(input.crmData, null, 2)}` : '## CRM Data\nNo CRM data available — this is a new user.'}
 
-## Budget Guidance (derived from keyword data above)
+## Budget Guidance
+${hasKeywordData ? `Derived from real keyword data above:
 - Average CPC: $${avgCpc}
 - Suggested daily budget range: $${suggestedDailyLow}-$${suggestedDailyHigh}/day (enough for 3-8 clicks/day at avg CPC)
-- Monthly hard cap should be 20-30x daily budget
+- Monthly hard cap should be 20-30x daily budget` : `⚠️ No CPC data available — cannot compute budget guidance.
+Set all budget values (recommendedDailyBudget, recommendedHardCap) to 0.
+Set estimatedClicksPerDay, estimatedCallsPerWeek, estimatedCostPerCall to 0.
+Set projectedRevenuePerMonth and projectedRoi to null.
+In the rationale, explain that budget recommendations require real keyword CPC data which is currently unavailable.`}
 
 ## Required JSON Output Schema:
 {
@@ -80,8 +93,8 @@ ${input.websiteContent ? `  "websiteAnalysis": "2-4 sentence analysis based on t
   "serviceOpportunities": [
     {
       "service": "service name",
-      "monthlySearches": number (sum from keyword data for this service),
-      "avgCpc": number (weighted average from keyword data for this service — DO NOT invent this),
+      "monthlySearches": ${hasKeywordData ? 'number (sum from keyword data for this service)' : '0 (no keyword data available — MUST be 0)'},
+      "avgCpc": ${hasKeywordData ? 'number (weighted average from keyword data for this service — DO NOT invent this)' : '0 (no keyword data available — MUST be 0)'},
       "competition": "low" | "medium" | "high",
       "crmWinRate": number or null,
       "crmAvgDealSize": number or null,
@@ -107,14 +120,15 @@ ${input.websiteContent ? `  "websiteAnalysis": "2-4 sentence analysis based on t
     // Think about where homeowners with painting budgets live — affluent suburbs, established neighborhoods, etc.
     // Order by estimated opportunity (most valuable markets first).
     // Mark the top 8-10 as "recommended: true" and the rest as "recommended: false".
-    // VARY the avgCpc and estimatedSearches per city — affluent suburbs and high-demand areas should have higher CPC
+${hasKeywordData ? `    // VARY the avgCpc and estimatedSearches per city — affluent suburbs and high-demand areas should have higher CPC
     // and more searches, while smaller/less competitive neighborhoods should have lower CPC. Use the keyword data
-    // CPC as a baseline and adjust ±10-30% depending on the city's affluence and competition.
+    // CPC as a baseline and adjust ±10-30% depending on the city's affluence and competition.` : `    // NO KEYWORD DATA AVAILABLE — set estimatedSearches and avgCpc to 0 or null for ALL cities.
+    // Do NOT invent or estimate search volumes or CPC values.`}
     {
       "city": "city or neighborhood name",
       "state": "state code (derived from the zip code)",
-      "estimatedSearches": number or null (vary by city size and demand — larger cities get more, smaller suburbs less),
-      "avgCpc": number or null (vary by city — use keyword CPC as baseline, adjust ±10-30% based on city affluence/competition),
+      "estimatedSearches": ${hasKeywordData ? 'number or null (vary by city size and demand — larger cities get more, smaller suburbs less)' : 'null (no data available)'},
+      "avgCpc": ${hasKeywordData ? 'number or null (vary by city — use keyword CPC as baseline, adjust ±10-30% based on city affluence/competition)' : 'null (no data available)'},
       "competition": "low" | "medium" | "high" or null (should vary by city — some areas are more saturated than others),
       "distanceMiles": number or null,
       "reason": "why this city is recommended — mention demographics, home values, or demand",
@@ -122,21 +136,30 @@ ${input.websiteContent ? `  "websiteAnalysis": "2-4 sentence analysis based on t
     }
   ],
   "budgetRecommendation": {
-    "recommendedDailyBudget": number (use the budget guidance above — should be $${suggestedDailyLow}-$${suggestedDailyHigh}/day based on actual CPC data),
+${hasKeywordData ? `    "recommendedDailyBudget": number (use the budget guidance above — should be $${suggestedDailyLow}-$${suggestedDailyHigh}/day based on actual CPC data),
     "recommendedHardCap": number (MONTHLY hard cap in dollars — pauses all ads once reached. Should be 20x-30x the daily budget),
     "estimatedClicksPerDay": number (= daily budget / avg CPC),
     "estimatedCallsPerWeek": number,
     "estimatedCostPerCall": number,
     "projectedRevenuePerMonth": number or null (only if CRM data available),
     "projectedRoi": number or null (only if CRM data available),
-    "rationale": "explain the budget recommendation referencing the actual CPC data"
+    "rationale": "explain the budget recommendation referencing the actual CPC data"` : `    "recommendedDailyBudget": 0 (no CPC data available — MUST be 0),
+    "recommendedHardCap": 0 (no CPC data available — MUST be 0),
+    "estimatedClicksPerDay": 0,
+    "estimatedCallsPerWeek": 0,
+    "estimatedCostPerCall": 0,
+    "projectedRevenuePerMonth": null,
+    "projectedRoi": null,
+    "rationale": "Budget recommendations are unavailable because keyword CPC data could not be retrieved from Google Ads Keyword Planner. This is likely because the developer token is pending Basic Access approval. Once approved, real CPC data will be available and accurate budget recommendations can be provided."`}
   }
 }
 
 Focus on:
-1. Which services have the best ROI opportunity (low CPC + high volume + high win rate if CRM data available)
+${hasKeywordData ? `1. Which services have the best ROI opportunity (low CPC + high volume + high win rate if CRM data available)
 2. Realistic budget recommendations derived from the actual CPC data provided
-3. Specific competitor weaknesses to exploit
+3. Specific competitor weaknesses to exploit` : `1. Competitor landscape analysis — focus on what data IS available
+2. CRM insights if available
+3. Clearly note that keyword/CPC/budget data is unavailable and recommendations are limited`}
 4. Provide 15-20 cities/neighborhoods/suburbs within 25-30 miles of the zip code, ranked by opportunity — include affluent areas and established neighborhoods where homeowners invest in painting. The main city plus surrounding suburbs, towns, and well-known neighborhoods.
 5. Be honest about competition — don't oversell if it's tough
 ${input.websiteContent ? '6. Analyze their ACTUAL website content provided above — do NOT guess or assume what pages exist. Reference specific service pages, CTAs, reviews, and content you found. Be accurate about what is present and what is missing.' : input.websiteUrl ? '6. Provide general website improvement recommendations since the site could not be fetched.' : ''}`;

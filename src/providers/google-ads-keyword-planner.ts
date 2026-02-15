@@ -1,18 +1,17 @@
 /**
  * Google Ads Keyword Planner Provider — Real Market Data
  *
- * Replaces the template-based EstimateMarketDataProvider with real
- * Google Ads Keyword Planner API calls. Returns actual CPC estimates,
- * search volumes, and competition levels for painting-related keywords
- * in the user's target geographic area.
+ * Google Ads Keyword Planner API provider — REAL DATA ONLY.
+ *
+ * Returns actual CPC estimates, search volumes, and competition levels
+ * for painting-related keywords in the user's target geographic area.
+ * No template fallbacks — if the API fails, the analysis will proceed
+ * with empty keyword data and the LLM will note the limitation.
  *
  * Requires:
  *   - Google Ads MCC account
  *   - OAuth credentials (client_id, client_secret, refresh_token)
- *   - Developer token (test or basic)
- *
- * Falls back to EstimateMarketDataProvider if credentials are missing
- * or API calls fail.
+ *   - Developer token (Basic Access required for production)
  */
 
 import { GoogleAdsApi, services as googleAdsServices, enums } from 'google-ads-api';

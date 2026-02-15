@@ -15,7 +15,6 @@
 
 import type { MarketAnalysisRequest, MarketAnalysis, MarketOverview, SerpResult } from '../types.js';
 import type { MarketDataProvider, CompetitorProvider, LlmProvider, LlmMarketAnalysisInput } from '../providers/interfaces.js';
-import { calculateMarketFactor, EstimateMarketDataProvider } from '../providers/keyword-estimates.js';
 import { getCrmSnapshot, logUsageEvent, saveMarketAnalysis } from '../db.js';
 import { analyzeWebsite, formatWebsiteForPrompt } from './website-analyzer.js';
 
@@ -72,14 +71,7 @@ export class MarketAnalysisService {
         : Promise.resolve(null),
     ]);
 
-    // Step 2: Compute market factor from competitor data, then fetch keywords
-    if (competitors.length > 0 && 'setMarketFactor' in this.deps.marketData) {
-      const avgReviews = competitors.reduce((sum, c) => sum + (c.reviewCount ?? 0), 0) / competitors.length;
-      const factor = calculateMarketFactor(competitors.length, avgReviews);
-      console.log(`[Analysis] Market factor: ${factor} (${competitors.length} competitors, avg ${Math.round(avgReviews)} reviews)`);
-      (this.deps.marketData as EstimateMarketDataProvider).setMarketFactor(factor);
-    }
-
+    // Step 2: Fetch real keyword data from Google Ads Keyword Planner
     const keywords = await this.deps.marketData.getKeywordData(
       request.services,
       request.targetCities || [],
@@ -178,7 +170,7 @@ export class MarketAnalysisService {
     hasCrm: boolean,
   ): string[] {
     const sources: string[] = [];
-    if (keywordCount > 0) sources.push('keyword_estimates');
+    if (keywordCount > 0) sources.push('google_ads_keyword_planner');
     if (competitorCount > 0) sources.push('google_places');
     if (serpCount > 0) sources.push('serper_serp');
     if (hasCrm) sources.push('crm_data');

@@ -19,8 +19,7 @@ import { loadConfig } from './config.js';
 import { initDb, getUsageQuota } from './db.js';
 import { createAuthMiddleware } from './middleware/auth.js';
 import { createUsageMiddleware } from './middleware/usage.js';
-import { GooglePlacesCompetitorProvider, SerperCompetitorProvider, EstimateMarketDataProvider, GoogleAdsKeywordPlannerProvider, OpenAiLlmProvider } from './providers/index.js';
-import type { MarketDataProvider } from './providers/interfaces.js';
+import { GooglePlacesCompetitorProvider, SerperCompetitorProvider, GoogleAdsKeywordPlannerProvider, OpenAiLlmProvider } from './providers/index.js';
 import { MarketAnalysisService } from './services/market-analysis.js';
 import { PlanGenerationService } from './services/plan-generation.js';
 import { createAnalysisRouter } from './routes/analysis.js';
@@ -36,35 +35,14 @@ async function main() {
   // Initialize DB
   initDb(config);
 
-  // Initialize providers — use real Keyword Planner if configured, with estimate fallback
-  const useRealKeywordData = GoogleAdsKeywordPlannerProvider.isConfigured(config);
-  const estimateProvider = new EstimateMarketDataProvider();
-  let marketDataProvider: MarketDataProvider;
-  if (useRealKeywordData) {
-    const realProvider = new GoogleAdsKeywordPlannerProvider(config);
-    // Wrap with fallback: try real, resort to estimates if empty/error
-    marketDataProvider = {
-      async getKeywordData(services, cities, state) {
-        try {
-          const realData = await realProvider.getKeywordData(services, cities, state);
-          if (realData.length > 0) {
-            console.log(`[Fallback] Using real Keyword Planner data (${realData.length} keywords)`);
-            return realData;
-          }
-        } catch (err) {
-          console.warn('[Fallback] Keyword Planner failed, using estimates:', err);
-        }
-        console.log('[Fallback] No real data — using template estimates');
-        return estimateProvider.getKeywordData(services, cities, state);
-      },
-      setMarketFactor(f: number) {
-        estimateProvider.setMarketFactor(f);
-      },
-    } as MarketDataProvider;
-  } else {
-    marketDataProvider = estimateProvider;
+  // Initialize providers — REAL data only, no template fallbacks
+  if (!GoogleAdsKeywordPlannerProvider.isConfigured(config)) {
+    console.error('[Growth Worker] ⚠️  Google Ads Keyword Planner is NOT configured!');
+    console.error('[Growth Worker] Missing one or more of: GOOGLE_ADS_DEVELOPER_TOKEN, GOOGLE_ADS_CLIENT_ID, GOOGLE_ADS_CLIENT_SECRET, GOOGLE_ADS_REFRESH_TOKEN, GOOGLE_ADS_MCC_CUSTOMER_ID');
+    console.error('[Growth Worker] The server will start but keyword data will be empty until credentials are configured.');
   }
-  console.log(`[Growth Worker] Keyword data source: ${useRealKeywordData ? 'Google Ads Keyword Planner (REAL) with estimate fallback' : 'Template estimates (FALLBACK)'}`);
+  const marketDataProvider = new GoogleAdsKeywordPlannerProvider(config);
+  console.log(`[Growth Worker] Keyword data source: Google Ads Keyword Planner (REAL DATA ONLY — no template fallback)`);
   const competitorProvider = new GooglePlacesCompetitorProvider(config);
   const serpProvider = config.serpEnabled ? new SerperCompetitorProvider(config) : null;
   const llmProvider = new OpenAiLlmProvider(config);
