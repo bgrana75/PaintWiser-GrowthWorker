@@ -139,3 +139,37 @@ PaintWiser uses the Google Ads API for three primary purposes:
 - **Developer:** PaintWiser LLC
 - **Email:** paintwiserapp@gmail.com
 - **Website:** https://www.paintwiser.com
+
+---
+
+## 9. Implementation Status & TODOs
+
+### Completed
+- [x] MCC account created (252-469-6376)
+- [x] Test developer token obtained (`6ee5jkCjMxIRRRnzEetHaQ`)
+- [x] Basic Access token application submitted (email: paintwiserapp@gmail.com)
+- [x] OAuth client credentials created (Client ID + Secret)
+- [x] Google Ads Keyword Planner provider built and tested (geo targets resolve correctly)
+- [x] All template/fallback keyword data removed — real data only
+- [x] LLM prompts hardened (forces 0/null when no real keyword data)
+- [x] OAuth routes built (`/oauth/google-ads/start` + `/callback`)
+- [x] Growth Hub page (multi-feature cards grid)
+- [x] GoogleAdsConnect onboarding page (requirements, guide, OAuth button)
+- [x] Wizard gated behind active Google Ads connection
+- [x] DB schema updated (`connected_by_user_id`, `encrypted_access_token`, `token_expires_at`)
+
+### Waiting On
+- [ ] **Basic Access token approval** (2-5 business days from application, submitted ~Feb 2026)
+  - Once approved, Keyword Planner API will return real CPC/volume data
+  - Currently returns "No customer found" (expected with test token)
+
+### TODO (After Basic Access)
+- [ ] **Add OAuth redirect URIs to Google Cloud Console:**
+  - Dev: `http://localhost:3002/oauth/google-ads/callback`
+  - Production: `https://growth.paintwiser.com/oauth/google-ads/callback` (or `http://147.135.15.155:3002/oauth/google-ads/callback`)
+- [ ] Test full OAuth flow end-to-end with a real Google Ads account
+- [ ] Test Keyword Planner with real keyword/CPC data
+- [ ] Build campaign creation (Phase 2 — Campaign, AdGroup, Ad, Keyword services)
+- [ ] Build performance reporting dashboard (Phase 3 — GAQL queries)
+- [ ] Implement token encryption for production (currently plaintext in DB)
+- [ ] Deploy updated growth worker to production server
