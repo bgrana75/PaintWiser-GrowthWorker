@@ -62,7 +62,7 @@ async function main() {
   // CORS — allow frontend dev server and production origins
   app.use((req, res, next) => {
     const origin = req.headers.origin || '';
-    const allowedOrigins = ['http://localhost:8081', 'http://localhost:19006', 'https://app.paintwiser.com'];
+    const allowedOrigins = ['http://localhost:8081', 'http://localhost:19006', 'https://app.paintwiser.com', 'http://147.135.15.155:3002'];
     if (allowedOrigins.includes(origin)) {
       res.setHeader('Access-Control-Allow-Origin', origin);
     }
