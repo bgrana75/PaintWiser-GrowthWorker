@@ -33,7 +33,7 @@ export function createOAuthRouter(config: Config): Router {
   const isLocalDev = process.env.NODE_ENV !== 'production' || process.env.DEV_BYPASS_AUTH === 'true';
   const baseUrl = isLocalDev
     ? `http://localhost:${config.port}`
-    : 'https://growth.paintwiser.com';
+    : 'https://growth.paintwiser.app';
   const callbackUrl = `${baseUrl}/oauth/google-ads/callback`;
 
   /**
