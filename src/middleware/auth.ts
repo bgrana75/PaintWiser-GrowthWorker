@@ -72,9 +72,20 @@ export function createAuthMiddleware(config: Config) {
         return;
       }
 
-      // Extract account_id from custom claims (set by Supabase auth hook)
-      const accountId = user.app_metadata?.account_id
+      // Extract account_id — check app_metadata first, then decode JWT claims
+      // (Supabase custom_access_token_hook adds account_id to JWT claims, not app_metadata)
+      let accountId = user.app_metadata?.account_id
         || user.user_metadata?.account_id;
+
+      if (!accountId) {
+        // Try decoding the JWT payload directly for custom claims
+        try {
+          const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+          accountId = payload.account_id;
+        } catch {
+          // ignore decode errors
+        }
+      }
 
       if (!accountId) {
         res.status(403).json({ error: 'No account_id found in token claims' });

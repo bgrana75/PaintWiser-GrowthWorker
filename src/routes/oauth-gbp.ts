@@ -25,7 +25,7 @@ const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GBP_SCOPE = 'https://www.googleapis.com/auth/business.manage';
 
 // Where the user ends up after OAuth completes
-const APP_SUCCESS_REDIRECT = 'https://app.paintwiser.com/growth/gbp';
+const APP_SUCCESS_REDIRECT = 'https://app.paintwiser.app/growth/gbp';
 const APP_SUCCESS_REDIRECT_DEV = 'http://localhost:8081/growth/gbp';
 
 export function createGbpOAuthRouter(config: Config): Router {
