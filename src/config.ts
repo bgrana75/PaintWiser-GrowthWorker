@@ -23,6 +23,10 @@ export interface Config {
   googleAdsRefreshToken: string;
   googleAdsMccCustomerId: string;
 
+  // GBP (separate Google Cloud project with approved API access)
+  gbpClientId: string;
+  gbpClientSecret: string;
+
   // Serper (Phase 2)
   serperApiKey: string;
   serpEnabled: boolean;
@@ -46,6 +50,9 @@ export function loadConfig(): Config {
     googleAdsClientSecret: process.env.GOOGLE_ADS_CLIENT_SECRET || '',
     googleAdsRefreshToken: process.env.GOOGLE_ADS_REFRESH_TOKEN || '',
     googleAdsMccCustomerId: (process.env.GOOGLE_ADS_MCC_CUSTOMER_ID || '').replace(/-/g, ''),
+
+    gbpClientId: process.env.GBP_CLIENT_ID || '',
+    gbpClientSecret: process.env.GBP_CLIENT_SECRET || '',
 
     serperApiKey: process.env.SERPER_API_KEY || '',
     serpEnabled: process.env.GROWTH_SERP_ENABLED === 'true',

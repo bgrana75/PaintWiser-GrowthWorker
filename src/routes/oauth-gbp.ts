@@ -53,9 +53,9 @@ export function createGbpOAuthRouter(config: Config): Router {
       return;
     }
 
-    if (!config.googleAdsClientId) {
-      // We reuse the same Google OAuth client credentials (client_id/secret)
-      // but request a different scope. The client_id is the same Google Cloud project.
+    const gbpClientId = config.gbpClientId || config.googleAdsClientId;
+    const gbpClientSecret = config.gbpClientSecret || config.googleAdsClientSecret;
+    if (!gbpClientId) {
       res.status(500).json({ error: 'Google OAuth is not configured on the server' });
       return;
     }
@@ -69,7 +69,7 @@ export function createGbpOAuthRouter(config: Config): Router {
     })).toString('base64url');
 
     const params = new URLSearchParams({
-      client_id: config.googleAdsClientId,
+      client_id: gbpClientId,
       redirect_uri: callbackUrl,
       response_type: 'code',
       scope: GBP_SCOPE,
@@ -125,8 +125,8 @@ export function createGbpOAuthRouter(config: Config): Router {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
           code: code as string,
-          client_id: config.googleAdsClientId,
-          client_secret: config.googleAdsClientSecret,
+          client_id: config.gbpClientId || config.googleAdsClientId,
+          client_secret: config.gbpClientSecret || config.googleAdsClientSecret,
           redirect_uri: callbackUrl,
           grant_type: 'authorization_code',
         }),

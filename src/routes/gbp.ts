@@ -318,8 +318,8 @@ async function refreshAccessToken(
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
-        client_id: config.googleAdsClientId,
-        client_secret: config.googleAdsClientSecret,
+        client_id: config.gbpClientId || config.googleAdsClientId,
+        client_secret: config.gbpClientSecret || config.googleAdsClientSecret,
         refresh_token: connection.encrypted_refresh_token,
         grant_type: 'refresh_token',
       }),
