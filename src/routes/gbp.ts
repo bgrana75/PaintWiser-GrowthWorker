@@ -94,6 +94,8 @@ export function createGbpRouter(config: Config): Router {
             headers: { 'Authorization': `Bearer ${refreshed}` },
           });
           if (!retryResponse.ok) {
+            const retryErr = await retryResponse.text();
+            console.error('[GBP] Retry after refresh failed:', retryResponse.status, retryErr);
             res.status(502).json({ error: 'Failed to list GBP accounts after token refresh.' });
             return;
           }
