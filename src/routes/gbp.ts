@@ -3,12 +3,17 @@
  *
  * Authenticated endpoints for GBP operations:
  *
- *   GET  /api/gbp/locations         — List accessible business locations (after OAuth)
- *   POST /api/gbp/select-location   — User selects a location, creates profile row
- *   GET  /api/gbp/profile           — Get stored profile data
+ *   GET  /api/gbp/locations                          — List accessible business locations
+ *   POST /api/gbp/select-location                    — Select a location, create profile row
+ *   GET  /api/gbp/profile                            — Get stored profile data
+ *   POST /api/gbp/import-reviews                     — Import reviews from Google
+ *   POST /api/gbp/reviews/:reviewId/generate-reply   — AI-draft a review reply
+ *   POST /api/gbp/reviews/:reviewId/reply            — Post reply to Google
+ *   POST /api/gbp/posts/generate                     — AI-draft a GBP post
+ *   POST /api/gbp/posts/:postId/publish              — Publish draft post to Google
+ *   POST /api/gbp/posts/:postId/dismiss              — Dismiss (soft-delete) a draft
  *
  * All routes require auth middleware (API key + JWT).
- * All GBP API calls use the connection's access token (server-side only).
  */
 
 import { Router, Request, Response } from 'express';
@@ -652,6 +657,306 @@ Write a reply:`;
     } catch (err) {
       console.error('[GBP] Error posting reply:', err);
       res.status(500).json({ error: 'Failed to post reply.' });
+    }
+  });
+
+  // =========================================================================
+  // POSTS
+  // =========================================================================
+
+  /**
+   * POST /api/gbp/posts/generate
+   *
+   * Uses OpenAI to generate a GBP post draft for the business.
+   * Saves the draft to growth_gbp_posts with status='draft'.
+   *
+   * Body: { promptType: 'project_showcase'|'tip'|'seasonal'|'availability'|'custom', customPrompt?: string }
+   */
+  router.post('/posts/generate', async (req: Request, res: Response) => {
+    const { accountId } = req.auth!;
+    const { promptType, customPrompt } = req.body;
+
+    const validTypes = ['project_showcase', 'tip', 'seasonal', 'availability', 'custom'];
+    if (!promptType || !validTypes.includes(promptType)) {
+      res.status(400).json({ error: `promptType must be one of: ${validTypes.join(', ')}` });
+      return;
+    }
+
+    if (promptType === 'custom' && (!customPrompt || typeof customPrompt !== 'string')) {
+      res.status(400).json({ error: 'customPrompt is required for custom prompt type.' });
+      return;
+    }
+
+    try {
+      // Get profile + connection
+      const { data: profile, error: profError } = await supabase
+        .from('growth_gbp_profile')
+        .select('*, growth_connected_accounts!inner(id)')
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .maybeSingle();
+
+      if (profError || !profile) {
+        res.status(404).json({ error: 'No GBP profile found.' });
+        return;
+      }
+
+      const businessName = profile.business_name || 'our painting business';
+      const connectionId = (profile as any).growth_connected_accounts.id;
+
+      const openai = new OpenAI({ apiKey: config.openaiApiKey });
+
+      const systemPrompt = `You are a social media content writer for a painting contractor business called "${businessName}".
+Write a Google Business Profile post. These posts appear on Google Maps and Search, and help the business rank higher locally.
+
+Rules:
+- Keep it 100-250 words
+- Be authentic and engaging, not salesy or robotic
+- Use a friendly, professional tone
+- Include a clear call-to-action at the end (e.g., "Call us for a free estimate!", "Book your consultation today!")
+- Do NOT use hashtags (they don't work on GBP)
+- Do NOT use emojis excessively (1-2 max if appropriate)
+- Write in first person plural ("we", "our team")
+- Focus on building trust and showcasing expertise`;
+
+      const promptMap: Record<string, string> = {
+        project_showcase: `Write a post showcasing a recent painting project. Make up realistic details about a residential or commercial project — describe the transformation, colors chosen, and the client's satisfaction. Make it feel like a real project update.`,
+        tip: `Write a helpful painting tip post. Share practical advice homeowners can use — things like how to choose the right paint finish, prep tips, maintenance advice, or color selection guidance. Position the business as an expert.`,
+        seasonal: `Write a seasonal post relevant to the current time of year. Connect painting services to seasonal needs — spring refresh, summer exterior work, fall prep, holiday interior updates. Make it timely and actionable.`,
+        availability: `Write a post about current availability and booking. Mention that the team has openings for new projects, encourage people to book soon, and highlight what types of projects you handle (interior, exterior, residential, commercial).`,
+        custom: customPrompt!,
+      };
+
+      const userPrompt = promptType === 'custom'
+        ? `Write a Google Business Profile post based on this direction: "${customPrompt}"`
+        : promptMap[promptType];
+
+      const completion = await openai.chat.completions.create({
+        model: config.openaiModel || 'gpt-4o',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.8,
+        max_tokens: 500,
+      });
+
+      const content = completion.choices[0]?.message?.content?.trim();
+      if (!content) {
+        res.status(500).json({ error: 'AI returned empty response.' });
+        return;
+      }
+
+      // Save as draft
+      const { data: post, error: insertError } = await supabase
+        .from('growth_gbp_posts')
+        .insert({
+          account_id: accountId,
+          connection_id: connectionId,
+          post_type: 'update',
+          content,
+          source: 'ai_generated',
+          ai_prompt_type: promptType,
+          status: 'draft',
+        })
+        .select()
+        .single();
+
+      if (insertError) {
+        console.error('[GBP] Error saving post draft:', insertError);
+        res.status(500).json({ error: 'Failed to save post draft.' });
+        return;
+      }
+
+      console.log(`[GBP] Post draft generated for account=${accountId}, type=${promptType}`);
+      res.json({ success: true, data: { post } });
+
+    } catch (err) {
+      console.error('[GBP] Error generating post:', err);
+      res.status(500).json({ error: 'Failed to generate post.' });
+    }
+  });
+
+  /**
+   * POST /api/gbp/posts/:postId/publish
+   *
+   * Publishes a draft post to Google Business Profile via the My Business v4 API.
+   * Updates the local row with gbp_post_id, status='published', published_at.
+   *
+   * Body (optional): { content?: string } — to update content before publishing
+   */
+  router.post('/posts/:postId/publish', async (req: Request, res: Response) => {
+    const { accountId } = req.auth!;
+    const { postId } = req.params;
+    const { content: updatedContent } = req.body || {};
+
+    try {
+      // Get the post
+      const { data: post, error: postError } = await supabase
+        .from('growth_gbp_posts')
+        .select('*')
+        .eq('id', postId)
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .single();
+
+      if (postError || !post) {
+        res.status(404).json({ error: 'Post not found.' });
+        return;
+      }
+
+      if (post.status === 'published') {
+        res.status(400).json({ error: 'Post is already published.' });
+        return;
+      }
+
+      const finalContent = (updatedContent && typeof updatedContent === 'string')
+        ? updatedContent.trim()
+        : post.content;
+
+      if (!finalContent) {
+        res.status(400).json({ error: 'Post content is empty.' });
+        return;
+      }
+
+      // Get profile + connection
+      const { data: profile, error: profError } = await supabase
+        .from('growth_gbp_profile')
+        .select('*, growth_connected_accounts!inner(id, encrypted_access_token, encrypted_refresh_token)')
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .maybeSingle();
+
+      if (profError || !profile) {
+        res.status(404).json({ error: 'No GBP profile found.' });
+        return;
+      }
+
+      const connection = (profile as any).growth_connected_accounts;
+      let accessToken: string = connection.encrypted_access_token;
+
+      // Need account name + location
+      let accountName = profile.gbp_account_name;
+      const locationId = profile.location_id;
+
+      if (!accountName) {
+        const discovered = await discoverAccountName(accessToken, locationId, connection, supabase, config);
+        if (!discovered) {
+          res.status(400).json({ error: 'Could not determine GBP account. Please re-select your location.' });
+          return;
+        }
+        accountName = discovered.accountName;
+        accessToken = discovered.accessToken;
+        await supabase.from('growth_gbp_profile').update({ gbp_account_name: accountName }).eq('id', profile.id);
+      }
+
+      // Build local post body for Google
+      const localPostBody: Record<string, unknown> = {
+        languageCode: 'en',
+        summary: finalContent,
+        topicType: 'STANDARD',
+      };
+
+      // If there's a CTA
+      if (post.cta_type && post.cta_type !== 'none' && post.cta_url) {
+        const ctaActionMap: Record<string, string> = {
+          call: 'CALL',
+          learn_more: 'LEARN_MORE',
+          book: 'BOOK',
+        };
+        localPostBody.callToAction = {
+          actionType: ctaActionMap[post.cta_type] || 'LEARN_MORE',
+          url: post.cta_url,
+        };
+      }
+
+      // Publish to Google My Business v4 API
+      const postUrl = `https://mybusiness.googleapis.com/v4/${accountName}/${locationId}/localPosts`;
+
+      let postResponse = await fetch(postUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(localPostBody),
+      });
+
+      // Handle 401 — refresh
+      if (postResponse.status === 401) {
+        const refreshed = await refreshAccessToken(connection, supabase, config);
+        if (!refreshed) {
+          res.status(401).json({ error: 'Token expired. Please reconnect.' });
+          return;
+        }
+        accessToken = refreshed;
+        postResponse = await fetch(postUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(localPostBody),
+        });
+      }
+
+      if (!postResponse.ok) {
+        const errBody = await postResponse.text();
+        console.error('[GBP] Failed to publish post:', postResponse.status, errBody);
+        res.status(502).json({ error: 'Failed to publish post to Google.' });
+        return;
+      }
+
+      const publishedData = await postResponse.json() as { name?: string };
+      const gbpPostId = publishedData.name || null; // e.g. "accounts/123/locations/456/localPosts/789"
+
+      // Update local post
+      await supabase
+        .from('growth_gbp_posts')
+        .update({
+          content: finalContent,
+          gbp_post_id: gbpPostId,
+          status: 'published',
+          published_at: new Date().toISOString(),
+        })
+        .eq('id', postId);
+
+      console.log(`[GBP] Post published: ${postId} → ${gbpPostId}`);
+      res.json({ success: true, data: { gbpPostId } });
+
+    } catch (err) {
+      console.error('[GBP] Error publishing post:', err);
+      res.status(500).json({ error: 'Failed to publish post.' });
+    }
+  });
+
+  /**
+   * DELETE-style soft dismiss: POST /api/gbp/posts/:postId/dismiss
+   *
+   * Marks a draft post as dismissed (soft delete).
+   */
+  router.post('/posts/:postId/dismiss', async (req: Request, res: Response) => {
+    const { accountId } = req.auth!;
+    const { postId } = req.params;
+
+    try {
+      const { error } = await supabase
+        .from('growth_gbp_posts')
+        .update({ status: 'dismissed', deleted: true })
+        .eq('id', postId)
+        .eq('account_id', accountId)
+        .eq('deleted', false);
+
+      if (error) {
+        console.error('[GBP] Error dismissing post:', error);
+        res.status(500).json({ error: 'Failed to dismiss post.' });
+        return;
+      }
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error('[GBP] Error dismissing post:', err);
+      res.status(500).json({ error: 'Failed to dismiss post.' });
     }
   });
 
