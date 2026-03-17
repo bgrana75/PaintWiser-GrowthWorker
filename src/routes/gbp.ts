@@ -794,7 +794,7 @@ Rules:
             quality: 'standard',
           });
 
-          const dalleUrl = imageResponse.data[0]?.url;
+          const dalleUrl = imageResponse.data?.[0]?.url;
           if (dalleUrl) {
             // Download the image and upload to Supabase Storage
             const imageRes = await fetch(dalleUrl);
