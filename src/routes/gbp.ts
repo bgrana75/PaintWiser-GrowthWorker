@@ -670,13 +670,25 @@ Write a reply:`;
    * Uses OpenAI to generate a GBP post draft for the business.
    * Saves the draft to growth_gbp_posts with status='draft'.
    *
-   * Body: { promptType: 'project_showcase'|'tip'|'seasonal'|'availability'|'custom', customPrompt?: string }
+   * For tip/seasonal: also generates a DALL-E image and uploads to Supabase Storage.
+   * For project_showcase: expects form data (jobType, location, description).
+   *   Photos are uploaded separately by the app and the media_url is passed in.
+   *
+   * Body: {
+   *   promptType: 'project_showcase'|'tip'|'seasonal'|'custom',
+   *   customPrompt?: string,
+   *   // Showcase-specific fields:
+   *   jobType?: 'interior'|'exterior'|'both',
+   *   location?: string,
+   *   description?: string,
+   *   mediaUrl?: string   // Already-uploaded photo URL
+   * }
    */
   router.post('/posts/generate', async (req: Request, res: Response) => {
     const { accountId } = req.auth!;
-    const { promptType, customPrompt } = req.body;
+    const { promptType, customPrompt, jobType, location, description, mediaUrl } = req.body;
 
-    const validTypes = ['project_showcase', 'tip', 'seasonal', 'availability', 'custom'];
+    const validTypes = ['project_showcase', 'tip', 'seasonal', 'custom'];
     if (!promptType || !validTypes.includes(promptType)) {
       res.status(400).json({ error: `promptType must be one of: ${validTypes.join(', ')}` });
       return;
@@ -685,6 +697,17 @@ Write a reply:`;
     if (promptType === 'custom' && (!customPrompt || typeof customPrompt !== 'string')) {
       res.status(400).json({ error: 'customPrompt is required for custom prompt type.' });
       return;
+    }
+
+    if (promptType === 'project_showcase') {
+      if (!jobType || !['interior', 'exterior', 'both'].includes(jobType)) {
+        res.status(400).json({ error: 'jobType (interior/exterior/both) is required for project showcase.' });
+        return;
+      }
+      if (!location || typeof location !== 'string') {
+        res.status(400).json({ error: 'location is required for project showcase.' });
+        return;
+      }
     }
 
     try {
@@ -719,17 +742,21 @@ Rules:
 - Write in first person plural ("we", "our team")
 - Focus on building trust and showcasing expertise`;
 
-      const promptMap: Record<string, string> = {
-        project_showcase: `Write a post showcasing a recent painting project. Make up realistic details about a residential or commercial project — describe the transformation, colors chosen, and the client's satisfaction. Make it feel like a real project update.`,
-        tip: `Write a helpful painting tip post. Share practical advice homeowners can use — things like how to choose the right paint finish, prep tips, maintenance advice, or color selection guidance. Position the business as an expert.`,
-        seasonal: `Write a seasonal post relevant to the current time of year. Connect painting services to seasonal needs — spring refresh, summer exterior work, fall prep, holiday interior updates. Make it timely and actionable.`,
-        availability: `Write a post about current availability and booking. Mention that the team has openings for new projects, encourage people to book soon, and highlight what types of projects you handle (interior, exterior, residential, commercial).`,
-        custom: customPrompt!,
-      };
+      // Build user prompt based on type
+      let userPrompt: string;
 
-      const userPrompt = promptType === 'custom'
-        ? `Write a Google Business Profile post based on this direction: "${customPrompt}"`
-        : promptMap[promptType];
+      if (promptType === 'project_showcase') {
+        const jobLabel = jobType === 'both' ? 'interior and exterior' : jobType;
+        userPrompt = `Write a post showcasing a real ${jobLabel} painting project we just completed in ${location}.${description ? ` Details: ${description}` : ''} Describe the transformation and the client's satisfaction. Make it feel like a genuine project update from our team.`;
+      } else if (promptType === 'custom') {
+        userPrompt = `Write a Google Business Profile post based on this direction: "${customPrompt}"`;
+      } else {
+        const promptMap: Record<string, string> = {
+          tip: `Write a helpful painting tip post. Share practical advice homeowners can use — things like how to choose the right paint finish, prep tips, maintenance advice, or color selection guidance. Position the business as an expert.`,
+          seasonal: `Write a seasonal post relevant to the current time of year. Connect painting services to seasonal needs — spring refresh, summer exterior work, fall prep, holiday interior updates. Make it timely and actionable.`,
+        };
+        userPrompt = promptMap[promptType];
+      }
 
       const completion = await openai.chat.completions.create({
         model: config.openaiModel || 'gpt-4o',
@@ -747,6 +774,58 @@ Rules:
         return;
       }
 
+      // For tip/seasonal, generate a DALL-E image
+      let finalMediaUrl: string | null = mediaUrl || null;
+
+      if ((promptType === 'tip' || promptType === 'seasonal') && !finalMediaUrl) {
+        try {
+          const imagePromptMap: Record<string, string> = {
+            tip: `A professional, clean photo-style image of a painting contractor at work. The scene shows a freshly painted room with beautiful colors, paint brushes, and a satisfied homeowner. Bright natural lighting, modern residential setting. No text or logos.`,
+            seasonal: `A beautiful exterior of a freshly painted house in a suburban neighborhood during ${getCurrentSeason()}. Professional painting work visible, vibrant colors, warm lighting. No text or logos.`,
+          };
+
+          console.log(`[GBP] Generating DALL-E image for ${promptType} post...`);
+
+          const imageResponse = await openai.images.generate({
+            model: 'dall-e-3',
+            prompt: imagePromptMap[promptType],
+            n: 1,
+            size: '1024x1024',
+            quality: 'standard',
+          });
+
+          const dalleUrl = imageResponse.data[0]?.url;
+          if (dalleUrl) {
+            // Download the image and upload to Supabase Storage
+            const imageRes = await fetch(dalleUrl);
+            if (imageRes.ok) {
+              const imageBuffer = await imageRes.arrayBuffer();
+              const imageId = crypto.randomUUID();
+              const storagePath = `${accountId}/${imageId}.jpg`;
+
+              const { error: uploadError } = await supabase.storage
+                .from('gbp-post-images')
+                .upload(storagePath, imageBuffer, {
+                  contentType: 'image/png',
+                  upsert: true,
+                });
+
+              if (!uploadError) {
+                const { data: publicUrlData } = supabase.storage
+                  .from('gbp-post-images')
+                  .getPublicUrl(storagePath);
+                finalMediaUrl = publicUrlData.publicUrl;
+                console.log(`[GBP] DALL-E image uploaded: ${finalMediaUrl}`);
+              } else {
+                console.warn('[GBP] Failed to upload DALL-E image:', uploadError.message);
+              }
+            }
+          }
+        } catch (imgErr) {
+          console.warn('[GBP] DALL-E image generation failed (continuing without image):', imgErr);
+        }
+      }
+
       // Save as draft
       const { data: post, error: insertError } = await supabase
         .from('growth_gbp_posts')
@@ -755,6 +834,7 @@ Rules:
           connection_id: connectionId,
           post_type: 'update',
           content,
+          media_url: finalMediaUrl,
           source: 'ai_generated',
           ai_prompt_type: promptType,
           status: 'draft',
@@ -856,6 +936,15 @@ Rules:
         summary: finalContent,
         topicType: 'STANDARD',
       };
+
+      // Attach media (photo) if available
+      const effectiveMediaUrl = post.media_url;
+      if (effectiveMediaUrl) {
+        localPostBody.media = [{
+          mediaFormat: 'PHOTO',
+          sourceUrl: effectiveMediaUrl,
+        }];
+      }
 
       // If there's a CTA
       if (post.cta_type && post.cta_type !== 'none' && post.cta_url) {
@@ -961,6 +1050,18 @@ Rules:
   });
 
   return router;
+}
+
+// ---------------------------------------------------------------------------
+// Season helper for seasonal post prompts
+// ---------------------------------------------------------------------------
+
+function getCurrentSeason(): string {
+  const month = new Date().getMonth(); // 0-11
+  if (month >= 2 && month <= 4) return 'spring';
+  if (month >= 5 && month <= 7) return 'summer';
+  if (month >= 8 && month <= 10) return 'fall';
+  return 'winter';
 }
 
 // ---------------------------------------------------------------------------
