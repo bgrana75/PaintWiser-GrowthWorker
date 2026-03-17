@@ -12,6 +12,8 @@
  *   POST /api/gbp/posts/generate                     — AI-draft a GBP post
  *   POST /api/gbp/posts/:postId/publish              — Publish draft post to Google
  *   POST /api/gbp/posts/:postId/dismiss              — Dismiss (soft-delete) a draft
+ *   GET  /api/gbp/profile/details                    — Fetch full location details from Google
+ *   PATCH /api/gbp/update-profile                    — Push profile edits to Google + update local
  *
  * All routes require auth middleware (API key + JWT).
  */
@@ -1079,6 +1081,300 @@ Rules:
     } catch (err) {
       console.error('[GBP] Error dismissing post:', err);
       res.status(500).json({ error: 'Failed to dismiss post.' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Profile editing
+  // -------------------------------------------------------------------------
+
+  /**
+   * GET /api/gbp/profile/details
+   *
+   * Fetches the full location details from Google (hours, description, etc.)
+   * and returns them so the edit form can be populated with live data.
+   */
+  router.get('/profile/details', async (req: Request, res: Response) => {
+    const { accountId } = req.auth!;
+
+    try {
+      const { data: profile, error: profError } = await supabase
+        .from('growth_gbp_profile')
+        .select('*, growth_connected_accounts!inner(id, encrypted_access_token, encrypted_refresh_token)')
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .maybeSingle();
+
+      if (profError || !profile) {
+        res.status(404).json({ error: 'No GBP profile found.' });
+        return;
+      }
+
+      const connection = (profile as any).growth_connected_accounts;
+      let accessToken: string = connection.encrypted_access_token;
+      const locationId = profile.location_id;
+
+      if (!accessToken) {
+        res.status(401).json({ error: 'No access token. Please reconnect.' });
+        return;
+      }
+
+      // Fetch full location details from Google Business Information API v1
+      const readMask = 'name,title,storefrontAddress,phoneNumbers,websiteUri,regularHours,profile';
+      let detailsResponse = await fetch(
+        `${GBP_API_BASE}/${locationId}?readMask=${readMask}`,
+        { headers: { 'Authorization': `Bearer ${accessToken}` } }
+      );
+
+      if (detailsResponse.status === 401) {
+        const refreshed = await refreshAccessToken(connection, supabase, config);
+        if (!refreshed) {
+          res.status(401).json({ error: 'Token expired. Please reconnect.' });
+          return;
+        }
+        accessToken = refreshed;
+        detailsResponse = await fetch(
+          `${GBP_API_BASE}/${locationId}?readMask=${readMask}`,
+          { headers: { 'Authorization': `Bearer ${accessToken}` } }
+        );
+      }
+
+      if (!detailsResponse.ok) {
+        const errBody = await detailsResponse.text();
+        console.error('[GBP] Failed to fetch location details:', detailsResponse.status, errBody);
+        res.status(502).json({ error: 'Failed to fetch profile details from Google.' });
+        return;
+      }
+
+      const location = await detailsResponse.json() as {
+        name?: string;
+        title?: string;
+        storefrontAddress?: {
+          addressLines?: string[];
+          locality?: string;
+          administrativeArea?: string;
+          postalCode?: string;
+        };
+        phoneNumbers?: { primaryPhone?: string };
+        websiteUri?: string;
+        regularHours?: {
+          periods?: Array<{
+            openDay: string;
+            openTime: { hours?: number; minutes?: number };
+            closeDay: string;
+            closeTime: { hours?: number; minutes?: number };
+          }>;
+        };
+        profile?: { description?: string };
+      };
+
+      // Convert Google's regularHours to a simpler format for the frontend
+      const hours: Record<string, { open: boolean; openTime: string; closeTime: string }> = {};
+      const dayNames = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY'];
+      const dayKeys = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+
+      // Initialize all days as closed
+      for (const day of dayKeys) {
+        hours[day] = { open: false, openTime: '09:00', closeTime: '17:00' };
+      }
+
+      // Fill in from Google data
+      if (location.regularHours?.periods) {
+        for (const period of location.regularHours.periods) {
+          const dayIndex = dayNames.indexOf(period.openDay);
+          if (dayIndex >= 0) {
+            const dayKey = dayKeys[dayIndex];
+            const openH = String(period.openTime?.hours || 0).padStart(2, '0');
+            const openM = String(period.openTime?.minutes || 0).padStart(2, '0');
+            const closeH = String(period.closeTime?.hours || 0).padStart(2, '0');
+            const closeM = String(period.closeTime?.minutes || 0).padStart(2, '0');
+            hours[dayKey] = {
+              open: true,
+              openTime: `${openH}:${openM}`,
+              closeTime: `${closeH}:${closeM}`,
+            };
+          }
+        }
+      }
+
+      // Update local profile with fresh data from Google
+      const addr = location.storefrontAddress;
+      const addressStr = addr
+        ? [...(addr.addressLines || []), addr.locality, addr.administrativeArea, addr.postalCode]
+            .filter(Boolean)
+            .join(', ')
+        : profile.address;
+
+      await supabase
+        .from('growth_gbp_profile')
+        .update({
+          business_name: location.title || profile.business_name,
+          address: addressStr,
+          phone: location.phoneNumbers?.primaryPhone || profile.phone,
+          website: location.websiteUri || profile.website,
+          description: location.profile?.description || profile.description,
+          hours,
+        })
+        .eq('id', profile.id);
+
+      res.json({
+        success: true,
+        data: {
+          business_name: location.title || profile.business_name,
+          address: addressStr,
+          phone: location.phoneNumbers?.primaryPhone || profile.phone,
+          website: location.websiteUri || profile.website,
+          description: location.profile?.description || profile.description,
+          hours,
+          scheduling_url: profile.scheduling_url || null,
+        },
+      });
+
+    } catch (err) {
+      console.error('[GBP] Error fetching profile details:', err);
+      res.status(500).json({ error: 'Failed to fetch profile details.' });
+    }
+  });
+
+  /**
+   * PATCH /api/gbp/update-profile
+   *
+   * Pushes profile edits to Google Business Profile + updates local DB.
+   * Body: { phone?, website?, description?, hours?, schedulingUrl? }
+   *
+   * - phone, website, description, hours → pushed to Google via Business Information API v1
+   * - schedulingUrl → stored locally only (used as default CTA for posts)
+   */
+  router.patch('/update-profile', async (req: Request, res: Response) => {
+    const { accountId } = req.auth!;
+    const { phone, website, description, hours, schedulingUrl } = req.body || {};
+
+    try {
+      const { data: profile, error: profError } = await supabase
+        .from('growth_gbp_profile')
+        .select('*, growth_connected_accounts!inner(id, encrypted_access_token, encrypted_refresh_token)')
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .maybeSingle();
+
+      if (profError || !profile) {
+        res.status(404).json({ error: 'No GBP profile found.' });
+        return;
+      }
+
+      const connection = (profile as any).growth_connected_accounts;
+      let accessToken: string = connection.encrypted_access_token;
+      const locationId = profile.location_id;
+
+      // Build the Google API update body + updateMask
+      const updateBody: Record<string, unknown> = {};
+      const updateMaskParts: string[] = [];
+
+      if (phone !== undefined) {
+        updateBody.phoneNumbers = { primaryPhone: phone || '' };
+        updateMaskParts.push('phoneNumbers.primaryPhone');
+      }
+
+      if (website !== undefined) {
+        updateBody.websiteUri = website || '';
+        updateMaskParts.push('websiteUri');
+      }
+
+      if (description !== undefined) {
+        updateBody.profile = { description: description || '' };
+        updateMaskParts.push('profile.description');
+      }
+
+      if (hours && typeof hours === 'object') {
+        // Convert our format to Google's regularHours format
+        const dayNames = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY'];
+        const dayKeys = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+        const periods: Array<{
+          openDay: string;
+          openTime: { hours: number; minutes: number };
+          closeDay: string;
+          closeTime: { hours: number; minutes: number };
+        }> = [];
+
+        for (let i = 0; i < dayKeys.length; i++) {
+          const dayData = hours[dayKeys[i]];
+          if (dayData?.open) {
+            const [openH, openM] = (dayData.openTime || '09:00').split(':').map(Number);
+            const [closeH, closeM] = (dayData.closeTime || '17:00').split(':').map(Number);
+            periods.push({
+              openDay: dayNames[i],
+              openTime: { hours: openH, minutes: openM },
+              closeDay: dayNames[i],
+              closeTime: { hours: closeH, minutes: closeM },
+            });
+          }
+        }
+
+        updateBody.regularHours = { periods };
+        updateMaskParts.push('regularHours');
+      }
+
+      // Push to Google if there are changes to push
+      if (updateMaskParts.length > 0) {
+        const updateMask = updateMaskParts.join(',');
+        const updateUrl = `${GBP_API_BASE}/${locationId}?updateMask=${updateMask}`;
+
+        let updateResponse = await fetch(updateUrl, {
+          method: 'PATCH',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(updateBody),
+        });
+
+        if (updateResponse.status === 401) {
+          const refreshed = await refreshAccessToken(connection, supabase, config);
+          if (!refreshed) {
+            res.status(401).json({ error: 'Token expired. Please reconnect.' });
+            return;
+          }
+          accessToken = refreshed;
+          updateResponse = await fetch(updateUrl, {
+            method: 'PATCH',
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(updateBody),
+          });
+        }
+
+        if (!updateResponse.ok) {
+          const errBody = await updateResponse.text();
+          console.error('[GBP] Failed to update profile on Google:', updateResponse.status, errBody);
+          res.status(502).json({ error: 'Failed to update profile on Google. Changes not saved.' });
+          return;
+        }
+
+        console.log(`[GBP] Profile updated on Google for account=${accountId}, fields: ${updateMask}`);
+      }
+
+      // Update local Supabase profile
+      const localUpdate: Record<string, unknown> = {};
+      if (phone !== undefined) localUpdate.phone = phone;
+      if (website !== undefined) localUpdate.website = website;
+      if (description !== undefined) localUpdate.description = description;
+      if (hours !== undefined) localUpdate.hours = hours;
+      if (schedulingUrl !== undefined) localUpdate.scheduling_url = schedulingUrl;
+
+      if (Object.keys(localUpdate).length > 0) {
+        await supabase
+          .from('growth_gbp_profile')
+          .update(localUpdate)
+          .eq('id', profile.id);
+      }
+
+      res.json({ success: true });
+
+    } catch (err) {
+      console.error('[GBP] Error updating profile:', err);
+      res.status(500).json({ error: 'Failed to update profile.' });
     }
   });
 
