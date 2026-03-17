@@ -14,6 +14,7 @@
 import { Router, Request, Response } from 'express';
 import type { Config } from '../config.js';
 import { createClient } from '@supabase/supabase-js';
+import OpenAI from 'openai';
 
 // Google Business Profile API base URL
 // Using the Business Information API (v1) — the current API for managing GBP data
@@ -455,6 +456,202 @@ export function createGbpRouter(config: Config): Router {
     } catch (err) {
       console.error('[GBP] Unexpected error importing reviews:', err);
       res.status(500).json({ error: 'Failed to import reviews.' });
+    }
+  });
+
+  /**
+   * POST /api/gbp/reviews/:reviewId/generate-reply
+   *
+   * Uses OpenAI to generate a professional reply draft for a review.
+   * Stores the draft on the review row.
+   */
+  router.post('/reviews/:reviewId/generate-reply', async (req: Request, res: Response) => {
+    const { accountId } = req.auth!;
+    const { reviewId } = req.params;
+
+    try {
+      // Get the review
+      const { data: review, error: reviewError } = await supabase
+        .from('growth_gbp_reviews')
+        .select('*')
+        .eq('id', reviewId)
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .single();
+
+      if (reviewError || !review) {
+        res.status(404).json({ error: 'Review not found.' });
+        return;
+      }
+
+      // Get business name for context
+      const { data: profile } = await supabase
+        .from('growth_gbp_profile')
+        .select('business_name')
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .maybeSingle();
+
+      const businessName = profile?.business_name || 'our business';
+
+      // Generate AI reply
+      const openai = new OpenAI({ apiKey: config.openaiApiKey });
+
+      const systemPrompt = `You are a friendly, professional reply writer for a painting contractor business called "${businessName}". 
+Write a reply to a Google Business Profile review. 
+
+Rules:
+- Keep it concise (2-4 sentences max)
+- Be genuine and warm, not corporate or robotic
+- Thank the reviewer by first name if available
+- For positive reviews (4-5 stars): express gratitude, mention you enjoy the work, invite them back
+- For negative reviews (1-2 stars): apologize sincerely, show empathy, offer to make it right, provide a way to reach you directly
+- For neutral reviews (3 stars): thank them, acknowledge feedback, express desire to improve
+- Never be defensive or argumentative
+- Don't use excessive exclamation marks
+- Sign off casually (no need for a formal signature)`;
+
+      const userPrompt = `Review from ${review.author_name || 'a customer'}:
+Rating: ${review.rating}/5 stars
+${review.comment ? `Comment: "${review.comment}"` : 'No written comment — rating only.'}
+
+Write a reply:`;
+
+      const completion = await openai.chat.completions.create({
+        model: config.openaiModel || 'gpt-4o',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.7,
+        max_tokens: 300,
+      });
+
+      const aiDraft = completion.choices[0]?.message?.content?.trim();
+      if (!aiDraft) {
+        res.status(500).json({ error: 'AI returned empty response.' });
+        return;
+      }
+
+      // Store the draft
+      await supabase
+        .from('growth_gbp_reviews')
+        .update({
+          ai_draft: aiDraft,
+          ai_draft_generated_at: new Date().toISOString(),
+          status: review.status === 'new' ? 'draft_generated' : review.status,
+        })
+        .eq('id', reviewId);
+
+      console.log(`[GBP] AI reply generated for review ${reviewId}`);
+      res.json({ success: true, data: { draft: aiDraft } });
+
+    } catch (err) {
+      console.error('[GBP] Error generating reply:', err);
+      res.status(500).json({ error: 'Failed to generate reply.' });
+    }
+  });
+
+  /**
+   * POST /api/gbp/reviews/:reviewId/reply
+   *
+   * Posts the reply to Google and updates the local review row.
+   */
+  router.post('/reviews/:reviewId/reply', async (req: Request, res: Response) => {
+    const { accountId } = req.auth!;
+    const { reviewId } = req.params;
+    const { replyText } = req.body;
+
+    if (!replyText || typeof replyText !== 'string' || replyText.trim().length === 0) {
+      res.status(400).json({ error: 'replyText is required.' });
+      return;
+    }
+
+    try {
+      // Get review + connection
+      const { data: review, error: reviewError } = await supabase
+        .from('growth_gbp_reviews')
+        .select('*, growth_connected_accounts!inner(id, encrypted_access_token, encrypted_refresh_token)')
+        .eq('id', reviewId)
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .single();
+
+      if (reviewError || !review) {
+        res.status(404).json({ error: 'Review not found.' });
+        return;
+      }
+
+      // Get profile for account name + location
+      const { data: profile } = await supabase
+        .from('growth_gbp_profile')
+        .select('gbp_account_name, location_id')
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .maybeSingle();
+
+      if (!profile?.gbp_account_name || !profile?.location_id) {
+        res.status(400).json({ error: 'GBP account not fully configured.' });
+        return;
+      }
+
+      const connection = (review as any).growth_connected_accounts;
+      let accessToken: string = connection.encrypted_access_token;
+
+      // Post reply to Google My Business v4 API
+      const replyUrl = `https://mybusiness.googleapis.com/v4/${profile.gbp_account_name}/${profile.location_id}/reviews/${review.gbp_review_id}/reply`;
+
+      let replyResponse = await fetch(replyUrl, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ comment: replyText.trim() }),
+      });
+
+      // Handle 401 — refresh token
+      if (replyResponse.status === 401) {
+        const refreshed = await refreshAccessToken(connection, supabase, config);
+        if (!refreshed) {
+          res.status(401).json({ error: 'Token expired. Please reconnect.' });
+          return;
+        }
+        accessToken = refreshed;
+        replyResponse = await fetch(replyUrl, {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ comment: replyText.trim() }),
+        });
+      }
+
+      if (!replyResponse.ok) {
+        const errBody = await replyResponse.text();
+        console.error('[GBP] Failed to post reply:', replyResponse.status, errBody);
+        res.status(502).json({ error: 'Failed to post reply to Google.' });
+        return;
+      }
+
+      // Update local review
+      await supabase
+        .from('growth_gbp_reviews')
+        .update({
+          owner_reply: replyText.trim(),
+          owner_reply_time: new Date().toISOString(),
+          replied_via_paintwiser: true,
+          status: 'replied',
+        })
+        .eq('id', reviewId);
+
+      console.log(`[GBP] Reply posted for review ${reviewId}`);
+      res.json({ success: true });
+
+    } catch (err) {
+      console.error('[GBP] Error posting reply:', err);
+      res.status(500).json({ error: 'Failed to post reply.' });
     }
   });
 
