@@ -729,6 +729,25 @@ Write a reply:`;
 
       const openai = new OpenAI({ apiKey: config.openaiApiKey });
 
+      // Fetch recent posts to avoid repeating themes
+      const { data: recentPosts } = await supabase
+        .from('growth_gbp_posts')
+        .select('content, ai_prompt_type, created_at')
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .in('status', ['draft', 'published'])
+        .order('created_at', { ascending: false })
+        .limit(8);
+
+      let recentPostsContext = '';
+      if (recentPosts && recentPosts.length > 0) {
+        const summaries = recentPosts.map((p, i) => {
+          const snippet = p.content.substring(0, 120).replace(/\n/g, ' ');
+          return `${i + 1}. [${p.ai_prompt_type || 'unknown'}] "${snippet}..."`;
+        }).join('\n');
+        recentPostsContext = `\n\nIMPORTANT — Here are the most recent posts already created. You MUST write about a DIFFERENT topic, angle, and approach. Do NOT repeat similar themes, tips, or talking points:\n${summaries}\n\nBe creative and explore a fresh angle that hasn't been covered recently.`;
+      }
+
       const systemPrompt = `You are a social media content writer for a painting contractor business called "${businessName}".
 Write a Google Business Profile post. These posts appear on Google Maps and Search, and help the business rank higher locally.
 
@@ -740,20 +759,22 @@ Rules:
 - Do NOT use hashtags (they don't work on GBP)
 - Do NOT use emojis excessively (1-2 max if appropriate)
 - Write in first person plural ("we", "our team")
-- Focus on building trust and showcasing expertise`;
+- Focus on building trust and showcasing expertise
+- Vary your writing style, opening lines, and structure from post to post
+- Use different calls-to-action each time${recentPostsContext}`;
 
       // Build user prompt based on type
       let userPrompt: string;
 
       if (promptType === 'project_showcase') {
         const jobLabel = jobType === 'both' ? 'interior and exterior' : jobType;
-        userPrompt = `Write a post showcasing a real ${jobLabel} painting project we just completed in ${location}.${description ? ` Details: ${description}` : ''} Describe the transformation and the client's satisfaction. Make it feel like a genuine project update from our team.`;
+        userPrompt = `Write a post showcasing a real ${jobLabel} painting project we just completed in ${location}.${description ? ` Details: ${description}` : ''} Describe the transformation and the client's satisfaction. Make it feel like a genuine project update from our team. Use a unique angle different from any previous showcase posts.`;
       } else if (promptType === 'custom') {
         userPrompt = `Write a Google Business Profile post based on this direction: "${customPrompt}"`;
       } else {
         const promptMap: Record<string, string> = {
-          tip: `Write a helpful painting tip post. Share practical advice homeowners can use — things like how to choose the right paint finish, prep tips, maintenance advice, or color selection guidance. Position the business as an expert.`,
-          seasonal: `Write a seasonal post relevant to the current time of year. Connect painting services to seasonal needs — spring refresh, summer exterior work, fall prep, holiday interior updates. Make it timely and actionable.`,
+          tip: `Write a helpful painting tip post. Share practical advice homeowners can use — things like how to choose the right paint finish, prep tips, maintenance advice, color selection guidance, or DIY vs professional considerations. Pick a specific, focused topic that hasn't been covered in recent posts. Position the business as an expert.`,
+          seasonal: `Write a seasonal post relevant to the current time of year. Connect painting services to seasonal needs — spring refresh, summer exterior work, fall prep, holiday interior updates, weather considerations, or seasonal color trends. Find a unique seasonal angle that hasn't been used recently. Make it timely and actionable.`,
         };
         userPrompt = promptMap[promptType];
       }
@@ -764,7 +785,7 @@ Rules:
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
-        temperature: 0.8,
+        temperature: 0.9,
         max_tokens: 500,
       });
 
@@ -779,16 +800,28 @@ Rules:
 
       if ((promptType === 'tip' || promptType === 'seasonal') && !finalMediaUrl) {
         try {
-          const imagePromptMap: Record<string, string> = {
-            tip: `A professional, clean photo-style image of a painting contractor at work. The scene shows a freshly painted room with beautiful colors, paint brushes, and a satisfied homeowner. Bright natural lighting, modern residential setting. No text or logos.`,
-            seasonal: `A beautiful exterior of a freshly painted house in a suburban neighborhood during ${getCurrentSeason()}. Professional painting work visible, vibrant colors, warm lighting. No text or logos.`,
-          };
+          // Vary image prompts for more diversity
+          const tipScenes = [
+            `A professional painter carefully applying paint to a wall with a roller, modern residential interior, bright natural lighting, beautiful color transformation. No text or logos.`,
+            `Close-up of premium paint brushes and rollers alongside fresh paint cans, a beautifully painted accent wall visible in the background. Clean, professional setting. No text or logos.`,
+            `A freshly painted living room with stunning before-and-after contrast, half the wall showing the old color. Professional painting equipment nearby. Natural light streaming in. No text or logos.`,
+            `A professional painting team finishing a kitchen cabinet refinish project, modern kitchen with fresh white cabinets, warm lighting. No text or logos.`,
+            `Exterior of a beautiful home with fresh vibrant paint, a professional painter on a ladder finishing trim work, clear blue sky. No text or logos.`,
+          ];
+          const seasonalScenes = [
+            `A beautiful exterior of a freshly painted house in a suburban neighborhood during ${getCurrentSeason()}. Professional painting work visible, vibrant colors, warm lighting. No text or logos.`,
+            `A cozy home interior freshly painted in warm ${getCurrentSeason()} tones, paint samples on a table, natural window light. No text or logos.`,
+            `A stunning curb-appeal transformation of a ${getCurrentSeason()} home exterior, fresh paint in modern colors, professional finish. No text or logos.`,
+          ];
+
+          const scenes = promptType === 'tip' ? tipScenes : seasonalScenes;
+          const imagePrompt = scenes[Math.floor(Math.random() * scenes.length)];
 
           console.log(`[GBP] Generating DALL-E image for ${promptType} post...`);
 
           const imageResponse = await openai.images.generate({
             model: 'dall-e-3',
-            prompt: imagePromptMap[promptType],
+            prompt: imagePrompt,
             n: 1,
             size: '1024x1024',
             quality: 'standard',
