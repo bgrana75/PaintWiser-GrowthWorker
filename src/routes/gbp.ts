@@ -235,6 +235,14 @@ export function createGbpRouter(config: Config): Router {
         })
         .eq('id', connection.id);
 
+      // Soft-delete any old profiles from previous connections for this account
+      await supabase
+        .from('growth_gbp_profile')
+        .update({ deleted: true })
+        .eq('account_id', accountId)
+        .neq('connection_id', connection.id)
+        .eq('deleted', false);
+
       // Create or update the GBP profile row
       const { data: existingProfile } = await supabase
         .from('growth_gbp_profile')
