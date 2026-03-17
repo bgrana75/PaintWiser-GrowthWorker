@@ -195,7 +195,7 @@ export function createGbpRouter(config: Config): Router {
    */
   router.post('/select-location', async (req: Request, res: Response) => {
     const { accountId } = req.auth!;
-    const { locationId, businessName, address, phone, website } = req.body;
+    const { locationId, businessName, address, phone, website, accountName } = req.body;
 
     if (!locationId || !businessName) {
       res.status(400).json({ error: 'Missing locationId or businessName' });
@@ -240,6 +240,7 @@ export function createGbpRouter(config: Config): Router {
           .from('growth_gbp_profile')
           .update({
             location_id: locationId,
+            gbp_account_name: accountName || null,
             business_name: businessName,
             address: address || null,
             phone: phone || null,
@@ -255,6 +256,7 @@ export function createGbpRouter(config: Config): Router {
             account_id: accountId,
             connection_id: connection.id,
             location_id: locationId,
+            gbp_account_name: accountName || null,
             business_name: businessName,
             address: address || null,
             phone: phone || null,
@@ -300,7 +302,220 @@ export function createGbpRouter(config: Config): Router {
     }
   });
 
+  /**
+   * POST /api/gbp/import-reviews
+   *
+   * Fetches reviews from the Google My Business API and upserts them
+   * into the growth_gbp_reviews table. Also updates profile stats.
+   */
+  router.post('/import-reviews', async (req: Request, res: Response) => {
+    const { accountId } = req.auth!;
+
+    try {
+      // Get connection + profile
+      const { data: profile, error: profError } = await supabase
+        .from('growth_gbp_profile')
+        .select('*, growth_connected_accounts!inner(id, encrypted_access_token, encrypted_refresh_token, status)')
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .maybeSingle();
+
+      if (profError || !profile) {
+        res.status(404).json({ error: 'No GBP profile found. Please select a location first.' });
+        return;
+      }
+
+      const connection = (profile as any).growth_connected_accounts;
+      let accessToken: string = connection.encrypted_access_token;
+
+      if (!accessToken) {
+        res.status(401).json({ error: 'No access token. Please reconnect.' });
+        return;
+      }
+
+      const gbpAccountName = profile.gbp_account_name;
+      const locationId = profile.location_id;
+
+      if (!gbpAccountName) {
+        // Fallback: discover account name by listing accounts and finding the one with this location
+        const discovered = await discoverAccountName(accessToken, locationId, connection, supabase, config);
+        if (!discovered) {
+          res.status(400).json({ error: 'Could not determine GBP account. Please re-select your location.' });
+          return;
+        }
+        // Store it for next time
+        await supabase.from('growth_gbp_profile').update({ gbp_account_name: discovered.accountName }).eq('id', profile.id);
+        accessToken = discovered.accessToken; // may have been refreshed
+      }
+
+      const effectiveAccountName = gbpAccountName || (await supabase.from('growth_gbp_profile').select('gbp_account_name').eq('id', profile.id).single()).data?.gbp_account_name;
+
+      // Fetch reviews from Google My Business v4 API
+      const reviewsUrl = `https://mybusiness.googleapis.com/v4/${effectiveAccountName}/${locationId}/reviews?pageSize=50`;
+
+      let reviewsResponse = await fetch(reviewsUrl, {
+        headers: { 'Authorization': `Bearer ${accessToken}` },
+      });
+
+      // Handle 401 — try refresh
+      if (reviewsResponse.status === 401) {
+        const refreshed = await refreshAccessToken(connection, supabase, config);
+        if (!refreshed) {
+          res.status(401).json({ error: 'Access token expired. Please reconnect.' });
+          return;
+        }
+        accessToken = refreshed;
+        reviewsResponse = await fetch(reviewsUrl, {
+          headers: { 'Authorization': `Bearer ${refreshed}` },
+        });
+      }
+
+      if (!reviewsResponse.ok) {
+        const errBody = await reviewsResponse.text();
+        console.error('[GBP] Failed to fetch reviews:', reviewsResponse.status, errBody);
+        res.status(502).json({ error: 'Failed to fetch reviews from Google.' });
+        return;
+      }
+
+      const reviewsData = await reviewsResponse.json() as {
+        reviews?: Array<{
+          name: string;
+          reviewId: string;
+          reviewer: { displayName?: string; profilePhotoUrl?: string };
+          starRating: string;
+          comment?: string;
+          createTime: string;
+          updateTime: string;
+          reviewReply?: { comment: string; updateTime: string };
+        }>;
+        averageRating?: number;
+        totalReviewCount?: number;
+        nextPageToken?: string;
+      };
+
+      const reviews = reviewsData.reviews || [];
+      console.log(`[GBP] Fetched ${reviews.length} reviews (total: ${reviewsData.totalReviewCount || 0})`);
+
+      // Star rating enum to number
+      const ratingMap: Record<string, number> = {
+        ONE: 1, TWO: 2, THREE: 3, FOUR: 4, FIVE: 5,
+      };
+
+      // Upsert reviews
+      let imported = 0;
+      for (const review of reviews) {
+        const rating = ratingMap[review.starRating] || 0;
+        const { error: upsertError } = await supabase
+          .from('growth_gbp_reviews')
+          .upsert({
+            account_id: accountId,
+            connection_id: connection.id,
+            gbp_review_id: review.reviewId,
+            author_name: review.reviewer?.displayName || null,
+            rating,
+            comment: review.comment || null,
+            review_time: review.createTime,
+            owner_reply: review.reviewReply?.comment || null,
+            owner_reply_time: review.reviewReply?.updateTime || null,
+          }, {
+            onConflict: 'account_id,gbp_review_id',
+            ignoreDuplicates: false,
+          });
+
+        if (upsertError) {
+          console.warn('[GBP] Error upserting review:', upsertError.message);
+        } else {
+          imported++;
+        }
+      }
+
+      // Update profile stats
+      const avgRating = reviewsData.averageRating || 0;
+      const totalReviews = reviewsData.totalReviewCount || reviews.length;
+
+      await supabase
+        .from('growth_gbp_profile')
+        .update({
+          total_reviews: totalReviews,
+          average_rating: avgRating,
+          last_imported_at: new Date().toISOString(),
+        })
+        .eq('id', profile.id);
+
+      console.log(`[GBP] Imported ${imported} reviews for account=${accountId}`);
+      res.json({
+        success: true,
+        data: {
+          imported,
+          totalReviews,
+          averageRating: avgRating,
+        },
+      });
+
+    } catch (err) {
+      console.error('[GBP] Unexpected error importing reviews:', err);
+      res.status(500).json({ error: 'Failed to import reviews.' });
+    }
+  });
+
   return router;
+}
+
+// ---------------------------------------------------------------------------
+// Discover account name (fallback for profiles created before accountName was stored)
+// ---------------------------------------------------------------------------
+
+async function discoverAccountName(
+  accessToken: string,
+  locationId: string,
+  connection: { id: string; encrypted_refresh_token: string },
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supabase: any,
+  config: Config
+): Promise<{ accountName: string; accessToken: string } | null> {
+  let token = accessToken;
+
+  const accountsResponse = await fetch(`${GBP_ACCOUNT_API_BASE}/accounts`, {
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+
+  if (accountsResponse.status === 401) {
+    const refreshed = await refreshAccessToken(connection, supabase, config);
+    if (!refreshed) return null;
+    token = refreshed;
+    const retryResp = await fetch(`${GBP_ACCOUNT_API_BASE}/accounts`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    if (!retryResp.ok) return null;
+    const retryData = await retryResp.json() as { accounts?: Array<{ name: string }> };
+    return findAccountForLocation(retryData.accounts || [], token, locationId);
+  }
+
+  if (!accountsResponse.ok) return null;
+  const accountsData = await accountsResponse.json() as { accounts?: Array<{ name: string }> };
+  const result = await findAccountForLocation(accountsData.accounts || [], token, locationId);
+  return result ? { ...result, accessToken: token } : null;
+}
+
+async function findAccountForLocation(
+  accounts: Array<{ name: string }>,
+  accessToken: string,
+  targetLocationId: string
+): Promise<{ accountName: string; accessToken: string } | null> {
+  for (const account of accounts) {
+    const locResponse = await fetch(
+      `${GBP_API_BASE}/${account.name}/locations?readMask=name`,
+      { headers: { 'Authorization': `Bearer ${accessToken}` } }
+    );
+    if (!locResponse.ok) continue;
+    const locData = await locResponse.json() as { locations?: Array<{ name: string }> };
+    for (const loc of locData.locations || []) {
+      if (loc.name === targetLocationId) {
+        return { accountName: account.name, accessToken };
+      }
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
