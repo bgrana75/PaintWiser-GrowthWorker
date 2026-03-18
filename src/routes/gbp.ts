@@ -12,6 +12,7 @@
  *   POST /api/gbp/posts/generate                     — AI-draft a GBP post
  *   POST /api/gbp/posts/:postId/publish              — Publish draft post to Google
  *   POST /api/gbp/posts/:postId/dismiss              — Dismiss (soft-delete) a draft
+ *   POST /api/gbp/import-metrics                      — Import daily performance metrics from Google
  *   GET  /api/gbp/profile/details                    — Fetch full location details from Google
  *   PATCH /api/gbp/update-profile                    — Push profile edits to Google + update local
  *
@@ -1093,6 +1094,208 @@ Rules:
   });
 
   // -------------------------------------------------------------------------
+  // Metrics & Health Score
+  // -------------------------------------------------------------------------
+
+  /**
+   * POST /api/gbp/import-metrics
+   *
+   * Fetches daily performance metrics from the Business Profile Performance API
+   * for the last 30 days. Upserts into growth_gbp_metrics_daily.
+   * Also recalculates the health score.
+   */
+  router.post('/import-metrics', async (req: Request, res: Response) => {
+    const { accountId } = req.auth!;
+
+    try {
+      // Get connection + profile
+      const { data: profile, error: profError } = await supabase
+        .from('growth_gbp_profile')
+        .select('*, growth_connected_accounts!inner(id, encrypted_access_token, encrypted_refresh_token, status)')
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .maybeSingle();
+
+      if (profError || !profile) {
+        res.status(404).json({ error: 'No GBP profile found. Please select a location first.' });
+        return;
+      }
+
+      const connection = (profile as any).growth_connected_accounts;
+      let accessToken: string = connection.encrypted_access_token;
+
+      if (!accessToken) {
+        res.status(401).json({ error: 'No access token. Please reconnect.' });
+        return;
+      }
+
+      const locationId = profile.location_id; // e.g. "locations/123456"
+
+      // Date range: last 30 days
+      const endDate = new Date();
+      const startDate = new Date();
+      startDate.setDate(endDate.getDate() - 30);
+
+      const dailyMetrics = [
+        'BUSINESS_IMPRESSIONS_DESKTOP_MAPS',
+        'BUSINESS_IMPRESSIONS_DESKTOP_SEARCH',
+        'BUSINESS_IMPRESSIONS_MOBILE_MAPS',
+        'BUSINESS_IMPRESSIONS_MOBILE_SEARCH',
+        'CALL_CLICKS',
+        'WEBSITE_CLICKS',
+        'BUSINESS_DIRECTION_REQUESTS',
+      ];
+
+      const params = new URLSearchParams();
+      for (const m of dailyMetrics) {
+        params.append('dailyMetrics', m);
+      }
+      params.set('dailyRange.startDate.year', String(startDate.getFullYear()));
+      params.set('dailyRange.startDate.month', String(startDate.getMonth() + 1));
+      params.set('dailyRange.startDate.day', String(startDate.getDate()));
+      params.set('dailyRange.endDate.year', String(endDate.getFullYear()));
+      params.set('dailyRange.endDate.month', String(endDate.getMonth() + 1));
+      params.set('dailyRange.endDate.day', String(endDate.getDate()));
+
+      const perfUrl = `https://businessprofileperformance.googleapis.com/v1/${locationId}:fetchMultiDailyMetricsTimeSeries?${params.toString()}`;
+
+      let perfResponse = await fetch(perfUrl, {
+        headers: { 'Authorization': `Bearer ${accessToken}` },
+      });
+
+      // Handle 401 — try refresh
+      if (perfResponse.status === 401) {
+        const refreshed = await refreshAccessToken(connection, supabase, config);
+        if (!refreshed) {
+          res.status(401).json({ error: 'Access token expired. Please reconnect.' });
+          return;
+        }
+        accessToken = refreshed;
+        perfResponse = await fetch(perfUrl, {
+          headers: { 'Authorization': `Bearer ${refreshed}` },
+        });
+      }
+
+      if (!perfResponse.ok) {
+        const errBody = await perfResponse.text();
+        console.error('[GBP] Failed to fetch performance metrics:', perfResponse.status, errBody);
+        res.status(502).json({ error: 'Failed to fetch metrics from Google.' });
+        return;
+      }
+
+      const perfData = await perfResponse.json() as {
+        multiDailyMetricTimeSeries?: Array<{
+          dailyMetricTimeSeries: {
+            dailyMetric: string;
+            timeSeries: {
+              datedValues: Array<{
+                date: { year: number; month: number; day: number };
+                value?: string;
+              }>;
+            };
+          };
+        }>;
+      };
+
+      // Build a day-indexed map: { "2025-03-01": { views_maps: X, views_search: Y, ... } }
+      const dayMap: Record<string, {
+        views_maps: number;
+        views_search: number;
+        actions_calls: number;
+        actions_directions: number;
+        actions_website: number;
+      }> = {};
+
+      for (const series of perfData.multiDailyMetricTimeSeries || []) {
+        const metric = series.dailyMetricTimeSeries.dailyMetric;
+        const values = series.dailyMetricTimeSeries.timeSeries?.datedValues || [];
+
+        for (const dv of values) {
+          const dateStr = `${dv.date.year}-${String(dv.date.month).padStart(2, '0')}-${String(dv.date.day).padStart(2, '0')}`;
+          if (!dayMap[dateStr]) {
+            dayMap[dateStr] = { views_maps: 0, views_search: 0, actions_calls: 0, actions_directions: 0, actions_website: 0 };
+          }
+          const val = parseInt(dv.value || '0', 10) || 0;
+
+          switch (metric) {
+            case 'BUSINESS_IMPRESSIONS_DESKTOP_MAPS':
+            case 'BUSINESS_IMPRESSIONS_MOBILE_MAPS':
+              dayMap[dateStr].views_maps += val;
+              break;
+            case 'BUSINESS_IMPRESSIONS_DESKTOP_SEARCH':
+            case 'BUSINESS_IMPRESSIONS_MOBILE_SEARCH':
+              dayMap[dateStr].views_search += val;
+              break;
+            case 'CALL_CLICKS':
+              dayMap[dateStr].actions_calls += val;
+              break;
+            case 'BUSINESS_DIRECTION_REQUESTS':
+              dayMap[dateStr].actions_directions += val;
+              break;
+            case 'WEBSITE_CLICKS':
+              dayMap[dateStr].actions_website += val;
+              break;
+          }
+        }
+      }
+
+      // Upsert daily metrics
+      let imported = 0;
+      for (const [date, metrics] of Object.entries(dayMap)) {
+        const { error: upsertError } = await supabase
+          .from('growth_gbp_metrics_daily')
+          .upsert({
+            account_id: accountId,
+            connection_id: connection.id,
+            date,
+            views_maps: metrics.views_maps,
+            views_search: metrics.views_search,
+            searches_direct: 0,
+            searches_discovery: 0,
+            actions_calls: metrics.actions_calls,
+            actions_directions: metrics.actions_directions,
+            actions_website: metrics.actions_website,
+          }, {
+            onConflict: 'account_id,connection_id,date',
+            ignoreDuplicates: false,
+          });
+
+        if (upsertError) {
+          console.warn('[GBP] Error upserting metric row:', upsertError.message);
+        } else {
+          imported++;
+        }
+      }
+
+      // Calculate health score
+      const healthScore = await calculateHealthScore(accountId, connection.id, profile, supabase);
+
+      // Update profile with health score
+      await supabase
+        .from('growth_gbp_profile')
+        .update({
+          health_score: healthScore,
+          health_last_calculated: new Date().toISOString(),
+        })
+        .eq('id', profile.id);
+
+      console.log(`[GBP] Imported ${imported} metric days, health score: ${healthScore} for account=${accountId}`);
+      res.json({
+        success: true,
+        data: {
+          imported,
+          daysWithData: Object.keys(dayMap).length,
+          healthScore,
+        },
+      });
+
+    } catch (err) {
+      console.error('[GBP] Unexpected error importing metrics:', err);
+      res.status(500).json({ error: 'Failed to import metrics.' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
   // Profile editing
   // -------------------------------------------------------------------------
 
@@ -1435,6 +1638,105 @@ async function discoverAccountName(
   const accountsData = await accountsResponse.json() as { accounts?: Array<{ name: string }> };
   const result = await findAccountForLocation(accountsData.accounts || [], token, locationId);
   return result ? { ...result, accessToken: token } : null;
+}
+
+// ---------------------------------------------------------------------------
+// Health score calculation
+// ---------------------------------------------------------------------------
+
+async function calculateHealthScore(
+  accountId: string,
+  connectionId: string,
+  profile: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supabase: any
+): Promise<number> {
+  let score = 0;
+
+  // 1. Profile completeness (up to 30 points)
+  const completenessChecks = [
+    { field: profile.phone, points: 5 },
+    { field: profile.website, points: 5 },
+    { field: profile.description, points: 8 },
+    { field: profile.hours && Object.keys(profile.hours || {}).length > 0, points: 7 },
+    { field: profile.scheduling_url, points: 5 },
+  ];
+  for (const check of completenessChecks) {
+    if (check.field) score += check.points;
+  }
+
+  // 2. Review response rate (up to 25 points)
+  const { count: totalReviews } = await supabase
+    .from('growth_gbp_reviews')
+    .select('*', { count: 'exact', head: true })
+    .eq('account_id', accountId)
+    .eq('deleted', false);
+
+  const { count: repliedReviews } = await supabase
+    .from('growth_gbp_reviews')
+    .select('*', { count: 'exact', head: true })
+    .eq('account_id', accountId)
+    .eq('deleted', false)
+    .not('owner_reply', 'is', null);
+
+  if (totalReviews && totalReviews > 0) {
+    const responseRate = (repliedReviews || 0) / totalReviews;
+    score += Math.round(responseRate * 25);
+  }
+
+  // 3. Post frequency — posts in last 30 days (up to 25 points)
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const { count: recentPosts } = await supabase
+    .from('growth_gbp_posts')
+    .select('*', { count: 'exact', head: true })
+    .eq('account_id', accountId)
+    .eq('status', 'published')
+    .eq('deleted', false)
+    .gte('published_at', thirtyDaysAgo.toISOString());
+
+  // 4+ posts/month = full points, scale linearly
+  const postScore = Math.min((recentPosts || 0) / 4, 1) * 25;
+  score += Math.round(postScore);
+
+  // 4. Activity trends — views in last 14 days vs previous 14 days (up to 20 points)
+  const fourteenDaysAgo = new Date();
+  fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 14);
+  const twentyEightDaysAgo = new Date();
+  twentyEightDaysAgo.setDate(twentyEightDaysAgo.getDate() - 28);
+
+  const { data: recentMetrics } = await supabase
+    .from('growth_gbp_metrics_daily')
+    .select('views_maps, views_search')
+    .eq('account_id', accountId)
+    .eq('connection_id', connectionId)
+    .eq('deleted', false)
+    .gte('date', fourteenDaysAgo.toISOString().split('T')[0]);
+
+  const { data: priorMetrics } = await supabase
+    .from('growth_gbp_metrics_daily')
+    .select('views_maps, views_search')
+    .eq('account_id', accountId)
+    .eq('connection_id', connectionId)
+    .eq('deleted', false)
+    .gte('date', twentyEightDaysAgo.toISOString().split('T')[0])
+    .lt('date', fourteenDaysAgo.toISOString().split('T')[0]);
+
+  const recentViews = (recentMetrics || []).reduce((sum: number, m: any) => sum + (m.views_maps || 0) + (m.views_search || 0), 0);
+  const priorViews = (priorMetrics || []).reduce((sum: number, m: any) => sum + (m.views_maps || 0) + (m.views_search || 0), 0);
+
+  if (recentViews > 0) {
+    // Base 10 points for having any views, +10 if trending up
+    score += 10;
+    if (priorViews > 0 && recentViews >= priorViews) {
+      score += 10;
+    } else if (priorViews === 0) {
+      // No prior data to compare — give benefit of the doubt
+      score += 5;
+    }
+  }
+
+  return Math.min(score, 100);
 }
 
 async function findAccountForLocation(
