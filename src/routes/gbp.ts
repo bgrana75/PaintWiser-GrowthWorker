@@ -1158,6 +1158,7 @@ Rules:
       params.set('dailyRange.endDate.day', String(endDate.getDate()));
 
       const perfUrl = `https://businessprofileperformance.googleapis.com/v1/${locationId}:fetchMultiDailyMetricsTimeSeries?${params.toString()}`;
+      console.log('[GBP] Fetching performance metrics from:', perfUrl);
 
       let perfResponse = await fetch(perfUrl, {
         headers: { 'Authorization': `Bearer ${accessToken}` },
@@ -1183,19 +1184,18 @@ Rules:
         return;
       }
 
-      const perfData = await perfResponse.json() as {
-        multiDailyMetricTimeSeries?: Array<{
-          dailyMetricTimeSeries: {
-            dailyMetric: string;
-            timeSeries: {
-              datedValues: Array<{
-                date: { year: number; month: number; day: number };
-                value?: string;
-              }>;
-            };
-          };
-        }>;
-      };
+      const perfRawText = await perfResponse.text();
+      console.log('[GBP] Performance API response status:', perfResponse.status);
+      console.log('[GBP] Performance API response body (first 1000 chars):', perfRawText.substring(0, 1000));
+
+      let perfData: any;
+      try {
+        perfData = JSON.parse(perfRawText);
+      } catch {
+        console.error('[GBP] Failed to parse performance API response');
+        res.status(502).json({ error: 'Invalid response from Google Performance API.' });
+        return;
+      }
 
       // Build a day-indexed map: { "2025-03-01": { views_maps: X, views_search: Y, ... } }
       const dayMap: Record<string, {
