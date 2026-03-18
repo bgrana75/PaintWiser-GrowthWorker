@@ -1338,7 +1338,7 @@ Rules:
       }
 
       // Fetch full location details from Google Business Information API v1
-      const readMask = 'name,title,storefrontAddress,phoneNumbers,websiteUri,regularHours,profile';
+      const readMask = 'name,title,storefrontAddress,phoneNumbers,websiteUri,regularHours,profile,metadata';
       let detailsResponse = await fetch(
         `${GBP_API_BASE}/${locationId}?readMask=${readMask}`,
         { headers: { 'Authorization': `Bearer ${accessToken}` } }
@@ -1384,6 +1384,7 @@ Rules:
           }>;
         };
         profile?: { description?: string };
+        metadata?: { mapsUri?: string; newReviewUri?: string; placeId?: string };
       };
 
       // Convert Google's regularHours to a simpler format for the frontend
@@ -1423,6 +1424,8 @@ Rules:
             .join(', ')
         : profile.address;
 
+      const reviewUrl = location.metadata?.newReviewUri || profile.review_url || null;
+
       await supabase
         .from('growth_gbp_profile')
         .update({
@@ -1432,6 +1435,7 @@ Rules:
           website: location.websiteUri || profile.website,
           description: location.profile?.description || profile.description,
           hours,
+          review_url: reviewUrl,
         })
         .eq('id', profile.id);
 
@@ -1445,6 +1449,7 @@ Rules:
           description: location.profile?.description || profile.description,
           hours,
           scheduling_url: profile.scheduling_url || null,
+          review_url: reviewUrl,
         },
       });
 
