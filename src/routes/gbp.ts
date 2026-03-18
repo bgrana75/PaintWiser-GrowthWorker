@@ -1207,34 +1207,41 @@ Rules:
       }> = {};
 
       for (const series of perfData.multiDailyMetricTimeSeries || []) {
-        const metric = series.dailyMetricTimeSeries.dailyMetric;
-        const values = series.dailyMetricTimeSeries.timeSeries?.datedValues || [];
+        // dailyMetricTimeSeries is an array of { dailyMetric, timeSeries }
+        const innerSeries = Array.isArray(series.dailyMetricTimeSeries)
+          ? series.dailyMetricTimeSeries
+          : [series.dailyMetricTimeSeries];
 
-        for (const dv of values) {
-          const dateStr = `${dv.date.year}-${String(dv.date.month).padStart(2, '0')}-${String(dv.date.day).padStart(2, '0')}`;
-          if (!dayMap[dateStr]) {
-            dayMap[dateStr] = { views_maps: 0, views_search: 0, actions_calls: 0, actions_directions: 0, actions_website: 0 };
-          }
-          const val = parseInt(dv.value || '0', 10) || 0;
+        for (const ts of innerSeries) {
+          const metric = ts.dailyMetric;
+          const values = ts.timeSeries?.datedValues || [];
 
-          switch (metric) {
-            case 'BUSINESS_IMPRESSIONS_DESKTOP_MAPS':
-            case 'BUSINESS_IMPRESSIONS_MOBILE_MAPS':
-              dayMap[dateStr].views_maps += val;
-              break;
-            case 'BUSINESS_IMPRESSIONS_DESKTOP_SEARCH':
-            case 'BUSINESS_IMPRESSIONS_MOBILE_SEARCH':
-              dayMap[dateStr].views_search += val;
-              break;
-            case 'CALL_CLICKS':
-              dayMap[dateStr].actions_calls += val;
-              break;
-            case 'BUSINESS_DIRECTION_REQUESTS':
-              dayMap[dateStr].actions_directions += val;
-              break;
-            case 'WEBSITE_CLICKS':
-              dayMap[dateStr].actions_website += val;
-              break;
+          for (const dv of values) {
+            const dateStr = `${dv.date.year}-${String(dv.date.month).padStart(2, '0')}-${String(dv.date.day).padStart(2, '0')}`;
+            if (!dayMap[dateStr]) {
+              dayMap[dateStr] = { views_maps: 0, views_search: 0, actions_calls: 0, actions_directions: 0, actions_website: 0 };
+            }
+            const val = parseInt(dv.value || '0', 10) || 0;
+
+            switch (metric) {
+              case 'BUSINESS_IMPRESSIONS_DESKTOP_MAPS':
+              case 'BUSINESS_IMPRESSIONS_MOBILE_MAPS':
+                dayMap[dateStr].views_maps += val;
+                break;
+              case 'BUSINESS_IMPRESSIONS_DESKTOP_SEARCH':
+              case 'BUSINESS_IMPRESSIONS_MOBILE_SEARCH':
+                dayMap[dateStr].views_search += val;
+                break;
+              case 'CALL_CLICKS':
+                dayMap[dateStr].actions_calls += val;
+                break;
+              case 'BUSINESS_DIRECTION_REQUESTS':
+                dayMap[dateStr].actions_directions += val;
+                break;
+              case 'WEBSITE_CLICKS':
+                dayMap[dateStr].actions_website += val;
+                break;
+            }
           }
         }
       }
