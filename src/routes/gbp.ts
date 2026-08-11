@@ -15,6 +15,7 @@
  *   POST /api/gbp/import-metrics                      — Import daily performance metrics from Google
  *   GET  /api/gbp/profile/details                    — Fetch full location details from Google
  *   PATCH /api/gbp/update-profile                    — Push profile edits to Google + update local
+ *   POST /api/gbp/review-requests/generate-email     — AI-draft a review request email
  *
  * All routes require auth middleware (API key + JWT).
  */
@@ -1598,6 +1599,90 @@ Rules:
     } catch (err) {
       console.error('[GBP] Error updating profile:', err);
       res.status(500).json({ error: 'Failed to update profile.' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // POST /api/gbp/review-requests/generate-email
+  //
+  // AI-generate a personalized review request email for a customer.
+  // -------------------------------------------------------------------------
+
+  router.post('/review-requests/generate-email', async (req: Request, res: Response) => {
+    try {
+      const { accountId } = (req as any).auth;
+      const { customerName, totalAmount } = req.body;
+
+      if (!customerName) {
+        return res.status(400).json({ error: 'customerName is required.' });
+      }
+
+      // Get business name for context
+      const { data: profile } = await supabase
+        .from('growth_gbp_profile')
+        .select('business_name')
+        .eq('account_id', accountId)
+        .eq('deleted', false)
+        .maybeSingle();
+
+      const businessName = profile?.business_name || 'our painting company';
+
+      const openai = new OpenAI({ apiKey: config.openaiApiKey });
+
+      const systemPrompt = `You are writing a friendly, short email on behalf of a painting contractor business called "${businessName}".
+
+The email asks a recent customer to leave a Google review. 
+
+Rules:
+- Keep it short and warm (3-5 sentences in the body)
+- Thank them for choosing the business
+- Mention you hope they're enjoying the results
+- Ask if they'd take a moment to leave a review
+- Mention it helps small businesses like yours grow
+- Don't be pushy or over-the-top
+- Don't use excessive exclamation marks
+- Keep a casual, human tone — not corporate
+- Don't include the review link in the body — that will be handled by a button in the email template
+- Return ONLY a JSON object with "subject" and "body" fields
+- The body should be plain text (no HTML), with \\n for line breaks`;
+
+      const userPrompt = `Customer: ${customerName}${totalAmount ? `\nProject value: $${Number(totalAmount).toLocaleString()}` : ''}
+
+Generate the email:`;
+
+      const completion = await openai.chat.completions.create({
+        model: config.openaiModel || 'gpt-4o',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.7,
+        max_tokens: 400,
+        response_format: { type: 'json_object' },
+      });
+
+      const raw = completion.choices[0]?.message?.content?.trim() || '{}';
+      let parsed: { subject?: string; body?: string };
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        parsed = {
+          subject: `How was your experience with ${businessName}?`,
+          body: `Hi ${customerName},\n\nThank you for choosing ${businessName} for your recent project. We hope you're loving the results!\n\nIf you have a moment, we'd really appreciate it if you could leave us a quick Google review. It makes a big difference for small businesses like ours.\n\nThanks again!`,
+        };
+      }
+
+      res.json({
+        success: true,
+        data: {
+          subject: parsed.subject || `How was your experience with ${businessName}?`,
+          body: parsed.body || '',
+        },
+      });
+
+    } catch (err) {
+      console.error('[GBP] Error generating review request email:', err);
+      res.status(500).json({ error: 'Failed to generate email draft.' });
     }
   });
 
