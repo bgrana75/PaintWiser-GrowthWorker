@@ -37,15 +37,19 @@ Omitting it breaks the build or runtime. There are no path aliases — relative 
 
 ## Deployment
 
-**The user is moving off Fly.io to a self-hosted server** (an existing shared box, until the product has paying tenants). `flyctl` is not installed on this machine. Treat the Fly setup below as the current state, not the target — don't add Fly-specific config, and prefer plain Docker that runs anywhere. The Dockerfile is already portable.
+**`fly.toml` is unused scaffolding — this service has never been deployed to Fly.io.** It has exactly one commit (the initial one) and `paintwiser-growth-worker.fly.dev` does not resolve. Do not run `fly deploy` and do not treat `fly.toml` as describing reality; `flyctl` isn't even installed on the dev machine.
 
-Fly.io app **`paintwiser-growth-worker`**, region `ord`, 512 MB shared VM, scale-to-zero (`min_machines_running = 0`), health check on `GET /health`.
+**Where it actually runs (verified 2026-08-12):** `http://147.135.15.155:3002` — the user's shared **dev/testing** OVH box, which hosts many unrelated projects (e.g. `aisomer`, behind nginx basic auth on 80/443). Plain HTTP, no TLS, no reverse proxy. `GET /health` returns 200.
 
-- `fly deploy` from the repo root
-- `fly secrets set KEY=value` — all secrets are injected this way; none are in `fly.toml`
-- `fly logs -a paintwiser-growth-worker`
+**This service has never had a production deployment.** It lives on a dev box and the production hostname was never wired up, so treat "where does this run in prod" as an open question, not a settled fact.
 
-The Dockerfile builds from `node:20-slim`, runs `npm install` → `npm run build` → `npm prune --production`, and listens on 3002.
+**Known live defect:** the deployed app calls `https://growth.paintwiser.app`, which has no DNS record and never worked — confirmed by inspecting the live web bundle, which has that URL baked in 9 times. A Cloudflare-proxied record could not reach this service anyway, because CF's proxy does not support origin port 3002. **Growth features are broken in production.** The correct address is in `paint-wiser/lib/growth/api-client.ts` as the hardcoded fallback, but the fallback only applies when `EXPO_PUBLIC_GROWTH_WORKER_URL` is unset, and it is set.
+
+Fixing this properly is part of `paint-wiser/docs/self-hosting-migration-plan.md`: move the service behind Caddy on a supported port with real TLS.
+
+The Dockerfile (`node:20-slim`, `npm install` → `npm run build` → `npm prune --production`, listens on 3002) is portable and runs anywhere — keep it that way.
+
+**Security note:** `EXPO_PUBLIC_GROWTH_API_KEY` is an `EXPO_PUBLIC_*` variable, so Expo inlines it into the client bundle at build time. Any user of the app can extract it and call this service directly, which spends OpenAI and Google Ads quota. Treat it as public, not as a secret, and rely on the Supabase-JWT path plus `usageMiddleware` quotas for real authorization.
 
 ## Architecture
 
