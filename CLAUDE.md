@@ -37,17 +37,29 @@ Omitting it breaks the build or runtime. There are no path aliases — relative 
 
 ## Deployment
 
-**`fly.toml` is unused scaffolding — this service has never been deployed to Fly.io.** It has exactly one commit (the initial one) and `paintwiser-growth-worker.fly.dev` does not resolve. Do not run `fly deploy` and do not treat `fly.toml` as describing reality; `flyctl` isn't even installed on the dev machine.
+**Where it runs (verified 2026-08-17):** `https://growth.paintwiser.app` — the
+self-hosted OVH box `51.81.67.77`, as the systemd service
+`paintwiser-growth-worker` on `127.0.0.1:4005`, fronted by Caddy with real TLS
+and Cloudflare in front of that. `GET /health` returns
+`{"status":"ok","service":"growth-worker"}`.
 
-**Where it actually runs (verified 2026-08-12):** `http://147.135.15.155:3002` — the user's shared **dev/testing** OVH box, which hosts many unrelated projects (e.g. `aisomer`, behind nginx basic auth on 80/443). Plain HTTP, no TLS, no reverse proxy. `GET /health` returns 200.
+Deploy with `paintwiser-deploy growth-worker` over `ssh ubuntu@51.81.67.77`. That
+pulls, runs `npm install && npm run build && npm prune --omit=dev`, restarts the
+unit, health-checks `http://127.0.0.1:4005/health`, and rolls back to the previous
+commit if the check fails. Env lives in `/opt/paintwiser/env/growth-worker.env`,
+not in a repo `.env`.
 
-**This service has never had a production deployment.** It lives on a dev box and the production hostname was never wired up, so treat "where does this run in prod" as an open question, not a settled fact.
+This service used to run on the user's shared **dev/testing** box at
+`http://147.135.15.155:3002` over plain HTTP, and `https://growth.paintwiser.app`
+had no DNS record, so Growth features were broken in production. Both halves are
+fixed. **The dev box is still answering on :3002** — it has not been
+decommissioned, so do not treat a healthy response from that address as evidence
+of anything.
 
-**Known live defect:** the deployed app calls `https://growth.paintwiser.app`, which has no DNS record and never worked — confirmed by inspecting the live web bundle, which has that URL baked in 9 times. A Cloudflare-proxied record could not reach this service anyway, because CF's proxy does not support origin port 3002. **Growth features are broken in production.** The correct address is in `paint-wiser/lib/growth/api-client.ts` as the hardcoded fallback, but the fallback only applies when `EXPO_PUBLIC_GROWTH_WORKER_URL` is unset, and it is set.
-
-Fixing this properly is part of `paint-wiser/docs/self-hosting-migration-plan.md`: move the service behind Caddy on a supported port with real TLS.
-
-The Dockerfile (`node:20-slim`, `npm install` → `npm run build` → `npm prune --production`, listens on 3002) is portable and runs anywhere — keep it that way.
+`fly.toml` and the `Dockerfile` were deleted on 2026-08-17. This service was never
+deployed to Fly, `paintwiser-growth-worker.fly.dev` never resolved, and the
+Dockerfile's only consumer was `fly.toml`'s `[build]` — it still `EXPOSE`d 3002
+while the service listens on 4005. Deployment is systemd, not a container.
 
 **Security note:** `EXPO_PUBLIC_GROWTH_API_KEY` is an `EXPO_PUBLIC_*` variable, so Expo inlines it into the client bundle at build time. Any user of the app can extract it and call this service directly, which spends OpenAI and Google Ads quota. Treat it as public, not as a secret, and rely on the Supabase-JWT path plus `usageMiddleware` quotas for real authorization.
 
