@@ -35,6 +35,17 @@ import type { Config } from '../config.js';
 
 Omitting it breaks the build or runtime. There are no path aliases — relative imports only.
 
+## Status: unfinished, and deliberately unreachable
+
+This worker backs the app's `/growth` route, which **nothing in the app links
+to** — it is reachable only by typing the URL. The feature was mid-build when
+work stopped and it is not part of the launch: PaintWiser ships without Growth,
+and what happens to Growth is decided afterwards (possibly as its own product,
+which is where the `growth.paintwiser.app` subdomain came from).
+
+Treat gaps here as unfinished work, not regressions, and do not wire it into the
+app's navigation.
+
 ## Deployment
 
 **Where it runs (verified 2026-08-17):** `https://growth.paintwiser.app` — the
